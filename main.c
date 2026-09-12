@@ -130,10 +130,41 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
 
 static void print_usage(const char *program_name)
 {
+    recovery_engine_config_t defaults = recovery_engine_default_config();
+
     fprintf(stderr,
-            "usage: %s --input-primary-url <url> --input-secondary-url <url> [--output-url <url>] "
-            "[--primary-delay-ms <ms>] [--max-secondary-latency-ms <ms>] [--alignment-window-ms <ms>]\n",
-            program_name);
+            "Usage:\n"
+            "  %s --input-primary-url <url> --input-secondary-url <url> [options]\n"
+            "\n"
+            "Options:\n"
+            "  --input-primary-url <url>\n"
+            "      Required. UDP URL for stream #1, the preferred source of truth.\n"
+            "\n"
+            "  --input-secondary-url <url>\n"
+            "      Required. UDP URL for stream #2, the delayed recovery witness.\n"
+            "\n"
+            "  --output-url <url>\n"
+            "      UDP destination for recovered output. Default: %s\n"
+            "\n"
+            "  --primary-delay-ms <ms>\n"
+            "      Milliseconds to delay stream #1 before output, allowing stream #2 time to arrive.\n"
+            "      Default: %llu\n"
+            "\n"
+            "  --max-secondary-latency-ms <ms>\n"
+            "      Maximum trusted arrival latency from stream #1 to stream #2 for recovery matches.\n"
+            "      Default: %llu\n"
+            "\n"
+            "  --alignment-window-ms <ms>\n"
+            "      Arrival-time search window used when comparing packets for stream alignment.\n"
+            "      Default: %llu\n"
+            "\n"
+            "  -h, --help\n"
+            "      Show this help page.\n",
+            program_name,
+            DEFAULT_OUTPUT_URL,
+            (unsigned long long)(defaults.primary_delay_ns / 1000000ULL),
+            (unsigned long long)(defaults.max_secondary_latency_ns / 1000000ULL),
+            (unsigned long long)(defaults.alignment_window_ns / 1000000ULL));
 }
 
 static int parse_u64_ms_option(const char *name, const char *value, uint64_t *target_ns)
