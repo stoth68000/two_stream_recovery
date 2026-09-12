@@ -8,6 +8,8 @@
 #include <string.h>
 
 #define CAPTURE_MAX_PACKETS 4096
+#define REAL_TS_PATH "1280x720p5994-avc-dwts-2xac3-20mb-5min.ts"
+#define REAL_TS_MAX_PACKETS 8192
 
 typedef struct capture_sink {
     uint8_t packets[CAPTURE_MAX_PACKETS][TS_PACKET_SIZE];
@@ -572,6 +574,183 @@ static void test_generated_parser_sweep(void)
     assert(parsed == 496);
 }
 
+static size_t load_real_ts_packets(uint8_t packets[][TS_PACKET_SIZE], size_t max_packets)
+{
+    FILE *file = fopen(REAL_TS_PATH, "rb");
+    size_t count = 0;
+
+    if (file == NULL) {
+        return 0;
+    }
+
+    while (count < max_packets && fread(packets[count], 1, TS_PACKET_SIZE, file) == TS_PACKET_SIZE) {
+        count++;
+    }
+
+    fclose(file);
+    return count;
+}
+
+static bool real_packet_is_recoverable_content(const uint8_t packet[TS_PACKET_SIZE], ts_packet_info_t *info)
+{
+    return ts_packet_parse(packet, info) && !info->is_null && !info->transport_error &&
+           !info->discontinuity_indicator && info->has_payload;
+}
+
+static bool find_real_same_pid_run(uint8_t packets[][TS_PACKET_SIZE], size_t packet_count,
+                                   size_t min_run, size_t *run_start)
+{
+    size_t i;
+
+    for (i = 0; i + min_run <= packet_count; i++) {
+        ts_packet_info_t first;
+        size_t j;
+
+        if (!real_packet_is_recoverable_content(packets[i], &first)) {
+            continue;
+        }
+
+        for (j = 1; j < min_run; j++) {
+            ts_packet_info_t current;
+            uint8_t expected_counter = (uint8_t)((first.continuity_counter + j) & 0x0fU);
+
+            if (!real_packet_is_recoverable_content(packets[i + j], &current) ||
+                current.pid != first.pid || current.continuity_counter != expected_counter) {
+                break;
+            }
+        }
+
+        if (j == min_run) {
+            *run_start = i;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void test_real_file_parser_window(void)
+{
+    static uint8_t packets[REAL_TS_MAX_PACKETS][TS_PACKET_SIZE];
+    bool seen_pid[REPORT_STATS_PIDS] = {false};
+    size_t packet_count = load_real_ts_packets(packets, REAL_TS_MAX_PACKETS);
+    size_t parsed_count = 0;
+    size_t pid_count = 0;
+    size_t pcr_count = 0;
+    size_t i;
+
+    if (packet_count == 0) {
+        printf("skipping real TS parser test: %s not present\n", REAL_TS_PATH);
+        return;
+    }
+
+    assert(packet_count == REAL_TS_MAX_PACKETS);
+    for (i = 0; i < packet_count; i++) {
+        ts_packet_info_t info;
+
+        assert(ts_packet_parse(packets[i], &info));
+        parsed_count++;
+        if (!seen_pid[info.pid]) {
+            seen_pid[info.pid] = true;
+            pid_count++;
+        }
+        if (info.has_pcr) {
+            pcr_count++;
+        }
+    }
+
+    assert(parsed_count == packet_count);
+    assert(pid_count >= 3);
+    assert(pcr_count > 0);
+}
+
+static void test_real_file_alignment_with_offset(void)
+{
+    enum {
+        OFFSET = 7,
+        SHARED_PACKETS = 512
+    };
+    static uint8_t packets[REAL_TS_MAX_PACKETS][TS_PACKET_SIZE];
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    size_t packet_count = load_real_ts_packets(packets, REAL_TS_MAX_PACKETS);
+    size_t i;
+
+    if (packet_count == 0) {
+        printf("skipping real TS alignment test: %s not present\n", REAL_TS_PATH);
+        return;
+    }
+
+    assert(packet_count > OFFSET + SHARED_PACKETS);
+    init_engine(&engine, &stats, &capture, &sink);
+
+    for (i = 0; i < OFFSET; i++) {
+        push_packet(&engine, &stats, 1, packets[i]);
+    }
+    for (i = 0; i < SHARED_PACKETS; i++) {
+        push_packet(&engine, &stats, 0, packets[OFFSET + i]);
+        push_packet(&engine, &stats, 1, packets[OFFSET + i]);
+    }
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == SHARED_PACKETS);
+    assert(stats.alignment_confidence >= 20);
+    for (i = 0; i < SHARED_PACKETS; i++) {
+        assert(memcmp(capture.packets[i], packets[OFFSET + i], TS_PACKET_SIZE) == 0);
+    }
+
+    recovery_engine_free(&engine);
+}
+
+static void test_real_file_content_recovery_run(void)
+{
+    enum {
+        WARMUP_PACKETS = 12,
+        GAP_PACKETS = 3,
+        RUN_PACKETS = WARMUP_PACKETS + GAP_PACKETS + 1
+    };
+    static uint8_t packets[REAL_TS_MAX_PACKETS][TS_PACKET_SIZE];
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    size_t packet_count = load_real_ts_packets(packets, REAL_TS_MAX_PACKETS);
+    size_t run_start = 0;
+    size_t i;
+
+    if (packet_count == 0) {
+        printf("skipping real TS content recovery test: %s not present\n", REAL_TS_PATH);
+        return;
+    }
+
+    assert(find_real_same_pid_run(packets, packet_count, RUN_PACKETS, &run_start));
+    init_engine(&engine, &stats, &capture, &sink);
+
+    for (i = 0; i < WARMUP_PACKETS; i++) {
+        push_packet(&engine, &stats, 0, packets[run_start + i]);
+        push_packet(&engine, &stats, 1, packets[run_start + i]);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+
+    for (i = 0; i < GAP_PACKETS; i++) {
+        push_packet(&engine, &stats, 1, packets[run_start + WARMUP_PACKETS + i]);
+    }
+    push_packet(&engine, &stats, 0, packets[run_start + WARMUP_PACKETS + GAP_PACKETS]);
+    push_packet(&engine, &stats, 1, packets[run_start + WARMUP_PACKETS + GAP_PACKETS]);
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == RUN_PACKETS);
+    assert(stats.recovered_content_packets == GAP_PACKETS);
+    assert(stats.recovered_content_bursts == 1);
+    for (i = 0; i < RUN_PACKETS; i++) {
+        assert(memcmp(capture.packets[i], packets[run_start + i], TS_PACKET_SIZE) == 0);
+    }
+
+    recovery_engine_free(&engine);
+}
+
 int main(void)
 {
     test_ts_packet_parse();
@@ -585,6 +764,9 @@ int main(void)
     test_generated_null_recovery_sweep();
     test_generated_secondary_loss_sweep();
     test_generated_offset_recovery_sweep();
+    test_real_file_parser_window();
+    test_real_file_alignment_with_offset();
+    test_real_file_content_recovery_run();
     printf("test_recovery: ok\n");
     return 0;
 }
