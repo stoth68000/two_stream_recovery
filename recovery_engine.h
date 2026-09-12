@@ -12,9 +12,17 @@
 #define RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS 65536
 #define RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS 2048
 #define RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD 8
-#define RECOVERY_ENGINE_DEFAULT_DELAY_NS 2500000000ULL
+#define RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS 2500000000ULL
+#define RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS 5000000000ULL
+#define RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS 6000000000ULL
 #define RECOVERY_ENGINE_MAX_PCR_PIDS 32
 #define RECOVERY_ENGINE_MAX_CONTENT_BURST_PACKETS 15
+
+typedef struct recovery_engine_config {
+    uint64_t primary_delay_ns;
+    uint64_t max_secondary_latency_ns;
+    uint64_t alignment_window_ns;
+} recovery_engine_config_t;
 
 typedef struct alignment_state {
     bool has_alignment;
@@ -86,6 +94,7 @@ typedef struct pcr_timing_model {
 typedef struct recovery_engine {
     packet_sink_t *sink;
     report_stats_t *stats;
+    recovery_engine_config_t config;
     packet_history_t history[2];
     primary_delay_queue_t primary_queue;
     pcr_timing_model_t pcr_model[2];
@@ -95,7 +104,10 @@ typedef struct recovery_engine {
     output_pid_state_t output_pid_state[REPORT_STATS_PIDS];
 } recovery_engine_t;
 
+recovery_engine_config_t recovery_engine_default_config(void);
 int recovery_engine_init(recovery_engine_t *engine, packet_sink_t *sink, report_stats_t *stats);
+int recovery_engine_init_with_config(recovery_engine_t *engine, packet_sink_t *sink, report_stats_t *stats,
+                                     const recovery_engine_config_t *config);
 int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const uint8_t packet[TS_PACKET_SIZE],
                                 const ts_packet_info_t *info);
 int recovery_engine_drain(recovery_engine_t *engine, bool force);

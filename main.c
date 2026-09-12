@@ -21,6 +21,7 @@ typedef struct command_line_options {
     const char *input_primary_url;
     const char *input_secondary_url;
     const char *output_url;
+    recovery_engine_config_t recovery_config;
 } command_line_options_t;
 
 static void handle_signal(int signum)
@@ -56,7 +57,8 @@ static int process_datagram(recovery_engine_t *engine, report_stats_t *stats, in
     return 0;
 }
 
-static int run_loop(input_udp_t inputs[2], output_udp_t *output)
+static int run_loop(input_udp_t inputs[2], output_udp_t *output,
+                    const recovery_engine_config_t *recovery_config)
 {
     uint8_t buffer[INPUT_BUFFER_SIZE];
     report_stats_t stats;
@@ -65,7 +67,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
 
     report_stats_init(&stats);
     sink = output_udp_as_packet_sink(output);
-    if (recovery_engine_init(&engine, &sink, &stats) != 0) {
+    if (recovery_engine_init_with_config(&engine, &sink, &stats, recovery_config) != 0) {
         fprintf(stderr, "failed to initialize recovery engine\n");
         return -1;
     }
@@ -129,8 +131,26 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
 static void print_usage(const char *program_name)
 {
     fprintf(stderr,
-            "usage: %s --input-primary-url <url> --input-secondary-url <url> [--output-url <url>]\n",
+            "usage: %s --input-primary-url <url> --input-secondary-url <url> [--output-url <url>] "
+            "[--primary-delay-ms <ms>] [--max-secondary-latency-ms <ms>] [--alignment-window-ms <ms>]\n",
             program_name);
+}
+
+static int parse_u64_ms_option(const char *name, const char *value, uint64_t *target_ns)
+{
+    unsigned long long parsed;
+    char *end = NULL;
+
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed > UINT64_MAX / 1000000ULL) {
+        fprintf(stderr, "invalid millisecond value for %s: %s\n", name, value);
+        return -1;
+    }
+
+    *target_ns = (uint64_t)parsed * 1000000ULL;
+    return 0;
 }
 
 static int parse_command_line(int argc, char **argv, command_line_options_t *options)
@@ -139,10 +159,12 @@ static int parse_command_line(int argc, char **argv, command_line_options_t *opt
 
     memset(options, 0, sizeof(*options));
     options->output_url = DEFAULT_OUTPUT_URL;
+    options->recovery_config = recovery_engine_default_config();
 
     for (i = 1; i < argc; i++) {
         const char *name = argv[i];
         const char **target = NULL;
+        uint64_t *ms_target_ns = NULL;
 
         if (strcmp(name, "--input-primary-url") == 0) {
             target = &options->input_primary_url;
@@ -150,6 +172,12 @@ static int parse_command_line(int argc, char **argv, command_line_options_t *opt
             target = &options->input_secondary_url;
         } else if (strcmp(name, "--output-url") == 0) {
             target = &options->output_url;
+        } else if (strcmp(name, "--primary-delay-ms") == 0) {
+            ms_target_ns = &options->recovery_config.primary_delay_ns;
+        } else if (strcmp(name, "--max-secondary-latency-ms") == 0) {
+            ms_target_ns = &options->recovery_config.max_secondary_latency_ns;
+        } else if (strcmp(name, "--alignment-window-ms") == 0) {
+            ms_target_ns = &options->recovery_config.alignment_window_ns;
         } else if (strcmp(name, "--help") == 0 || strcmp(name, "-h") == 0) {
             print_usage(argv[0]);
             return 1;
@@ -163,6 +191,14 @@ static int parse_command_line(int argc, char **argv, command_line_options_t *opt
             fprintf(stderr, "missing value for option: %s\n", name);
             print_usage(argv[0]);
             return -1;
+        }
+
+        if (ms_target_ns != NULL) {
+            if (parse_u64_ms_option(name, argv[++i], ms_target_ns) != 0) {
+                print_usage(argv[0]);
+                return -1;
+            }
+            continue;
         }
 
         if (*target != NULL && target != &options->output_url) {
@@ -215,7 +251,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    result = run_loop(inputs, &output) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    result = run_loop(inputs, &output, &options.recovery_config) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 
     output_udp_close(&output);
     input_udp_close(&inputs[1]);

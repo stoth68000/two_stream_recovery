@@ -134,6 +134,11 @@ static bool record_is_informative(const packet_record_t *record)
     return !record->is_null && !record->transport_error;
 }
 
+static uint64_t time_difference_ns(uint64_t a, uint64_t b)
+{
+    return a >= b ? a - b : b - a;
+}
+
 static void observe_output_record(recovery_engine_t *engine, const packet_record_t *record)
 {
     if (!record->is_null && !record->transport_error && !record->discontinuity_indicator) {
@@ -334,6 +339,28 @@ static int score_alignment_match(const packet_record_t *record, const packet_rec
     return score;
 }
 
+static bool records_within_alignment_window(recovery_engine_t *engine, const packet_record_t *record,
+                                            const packet_record_t *candidate)
+{
+    return engine->config.alignment_window_ns == 0 ||
+           time_difference_ns(record->arrival_time_ns, candidate->arrival_time_ns) <=
+               engine->config.alignment_window_ns;
+}
+
+static bool secondary_match_within_latency(recovery_engine_t *engine, const packet_record_t *primary,
+                                           const packet_record_t *secondary)
+{
+    if (engine->config.max_secondary_latency_ns == 0) {
+        return true;
+    }
+    if (secondary->arrival_time_ns < primary->arrival_time_ns) {
+        return true;
+    }
+
+    return secondary->arrival_time_ns - primary->arrival_time_ns <=
+           engine->config.max_secondary_latency_ns;
+}
+
 static packet_record_t *find_secondary_match_for_primary(recovery_engine_t *engine,
                                                          const packet_record_t *primary)
 {
@@ -356,8 +383,8 @@ static packet_record_t *find_secondary_match_for_primary(recovery_engine_t *engi
         }
 
         candidate = packet_history_find_index(secondary, (uint64_t)candidate_index);
-        if (candidate != NULL && score_alignment_match(primary, candidate) >=
-                                     RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
+        if (candidate != NULL && secondary_match_within_latency(engine, primary, candidate) &&
+            score_alignment_match(primary, candidate) >= RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
             return candidate;
         }
     }
@@ -538,6 +565,10 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
             break;
         }
 
+        if (!records_within_alignment_window(engine, record, candidate)) {
+            continue;
+        }
+
         score = score_alignment_match(record, candidate);
         if (score > best_score) {
             best_score = score;
@@ -583,11 +614,30 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
     engine->stats->alignment_confidence = engine->alignment.confidence;
 }
 
+recovery_engine_config_t recovery_engine_default_config(void)
+{
+    recovery_engine_config_t config;
+
+    config.primary_delay_ns = RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS;
+    config.max_secondary_latency_ns = RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS;
+    config.alignment_window_ns = RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS;
+    return config;
+}
+
 int recovery_engine_init(recovery_engine_t *engine, packet_sink_t *sink, report_stats_t *stats)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+
+    return recovery_engine_init_with_config(engine, sink, stats, &config);
+}
+
+int recovery_engine_init_with_config(recovery_engine_t *engine, packet_sink_t *sink, report_stats_t *stats,
+                                     const recovery_engine_config_t *config)
 {
     memset(engine, 0, sizeof(*engine));
     engine->sink = sink;
     engine->stats = stats;
+    engine->config = *config;
 
     if (packet_history_init(&engine->history[0], RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS) != 0) {
         return -1;
@@ -597,7 +647,7 @@ int recovery_engine_init(recovery_engine_t *engine, packet_sink_t *sink, report_
         return -1;
     }
     if (primary_delay_queue_init(&engine->primary_queue, RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS,
-                                 RECOVERY_ENGINE_DEFAULT_DELAY_NS) != 0) {
+                                 engine->config.primary_delay_ns) != 0) {
         packet_history_free(&engine->history[1]);
         packet_history_free(&engine->history[0]);
         return -1;
