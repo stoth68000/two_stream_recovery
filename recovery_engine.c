@@ -115,6 +115,20 @@ static packet_record_t *packet_history_get_newest(packet_history_t *history, siz
     return &history->records[index];
 }
 
+static packet_record_t *packet_history_find_index(packet_history_t *history, uint64_t stream_index)
+{
+    size_t i;
+
+    for (i = 0; i < history->count; i++) {
+        size_t index = (history->start + i) % history->capacity;
+        if (history->records[index].stream_index == stream_index) {
+            return &history->records[index];
+        }
+    }
+
+    return NULL;
+}
+
 static bool record_is_informative(const packet_record_t *record)
 {
     return !record->is_null && !record->transport_error;
@@ -270,6 +284,96 @@ static int score_alignment_match(const packet_record_t *record, const packet_rec
     return score;
 }
 
+static packet_record_t *find_secondary_match_for_primary(recovery_engine_t *engine,
+                                                         const packet_record_t *primary)
+{
+    int64_t expected;
+    int64_t delta;
+    packet_history_t *secondary = &engine->history[1];
+
+    if (!record_is_informative(primary) || !engine->alignment.has_alignment ||
+        engine->alignment.confidence < 20) {
+        return NULL;
+    }
+
+    expected = (int64_t)primary->stream_index + engine->alignment.offset_packets;
+    for (delta = -8; delta <= 8; delta++) {
+        int64_t candidate_index = expected + delta;
+        packet_record_t *candidate;
+
+        if (candidate_index < 0) {
+            continue;
+        }
+
+        candidate = packet_history_find_index(secondary, (uint64_t)candidate_index);
+        if (candidate != NULL && score_alignment_match(primary, candidate) >=
+                                     RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
+            return candidate;
+        }
+    }
+
+    return NULL;
+}
+
+static bool secondary_range_is_all_null(recovery_engine_t *engine, uint64_t first_index, uint64_t last_index)
+{
+    uint64_t index;
+
+    if (first_index > last_index) {
+        return false;
+    }
+
+    for (index = first_index; index <= last_index; index++) {
+        packet_record_t *record = packet_history_find_index(&engine->history[1], index);
+        if (record == NULL || !record->is_null || record->transport_error) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int recover_nulls_before_primary(recovery_engine_t *engine, const packet_record_t *primary,
+                                        const packet_record_t *secondary_match)
+{
+    uint64_t primary_between;
+    uint64_t secondary_between;
+    uint64_t missing_nulls;
+    uint64_t output_index;
+
+    if (!engine->last_primary_anchor.valid || secondary_match == NULL ||
+        secondary_match->stream_index <= engine->last_primary_anchor.secondary_index ||
+        primary->stream_index <= engine->last_primary_anchor.primary_index) {
+        return 0;
+    }
+
+    primary_between = primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL;
+    secondary_between = secondary_match->stream_index - engine->last_primary_anchor.secondary_index - 1ULL;
+    if (secondary_between <= primary_between) {
+        return 0;
+    }
+
+    missing_nulls = secondary_between - primary_between;
+    if (!secondary_range_is_all_null(engine, engine->last_primary_anchor.secondary_index + 1ULL,
+                                     secondary_match->stream_index - 1ULL)) {
+        engine->stats->unrecoverable_null_regions++;
+        return 0;
+    }
+
+    for (output_index = secondary_match->stream_index - missing_nulls; output_index < secondary_match->stream_index;
+         output_index++) {
+        packet_record_t *null_record = packet_history_find_index(&engine->history[1], output_index);
+        if (null_record == NULL || output_udp_send_ts_packet(engine->output, null_record->packet) != 0) {
+            return -1;
+        }
+        engine->stats->recovered_packets++;
+        engine->stats->recovered_null_packets++;
+        engine->stats->output_packets++;
+    }
+
+    return 0;
+}
+
 static void update_alignment(recovery_engine_t *engine, int stream_id, const packet_record_t *record)
 {
     packet_history_t *other_history;
@@ -410,15 +514,26 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 
     while (engine->primary_queue.count > 0) {
         packet_record_t *record = primary_delay_queue_front(&engine->primary_queue);
+        packet_record_t *secondary_match;
 
         if (!force && now_ns - record->arrival_time_ns < engine->primary_queue.delay_ns) {
             break;
+        }
+
+        secondary_match = find_secondary_match_for_primary(engine, record);
+        if (recover_nulls_before_primary(engine, record, secondary_match) != 0) {
+            return -1;
         }
 
         if (output_udp_send_ts_packet(engine->output, record->packet) != 0) {
             return -1;
         }
         engine->stats->output_packets++;
+        if (secondary_match != NULL) {
+            engine->last_primary_anchor.valid = true;
+            engine->last_primary_anchor.primary_index = record->stream_index;
+            engine->last_primary_anchor.secondary_index = secondary_match->stream_index;
+        }
         primary_delay_queue_pop(&engine->primary_queue);
     }
 

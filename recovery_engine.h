@@ -23,6 +23,12 @@ typedef struct alignment_state {
     uint32_t consecutive_misses;
 } alignment_state_t;
 
+typedef struct primary_anchor {
+    bool valid;
+    uint64_t primary_index;
+    uint64_t secondary_index;
+} primary_anchor_t;
+
 typedef struct packet_record {
     uint64_t stream_index;
     uint64_t arrival_time_ns;
@@ -78,6 +84,7 @@ typedef struct recovery_engine {
     pcr_timing_model_t pcr_model[2];
     uint64_t next_stream_index[2];
     alignment_state_t alignment;
+    primary_anchor_t last_primary_anchor;
 } recovery_engine_t;
 
 int recovery_engine_init(recovery_engine_t *engine, output_udp_t *output, report_stats_t *stats);
