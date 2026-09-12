@@ -120,6 +120,135 @@ static bool record_is_informative(const packet_record_t *record)
     return !record->is_null && !record->transport_error;
 }
 
+static uint64_t packet_info_pcr_value(const ts_packet_info_t *info)
+{
+    return (info->pcr_base * 300ULL) + info->pcr_extension;
+}
+
+static uint64_t pcr_delta(uint64_t later, uint64_t earlier)
+{
+    const uint64_t wrap = 1ULL << 42U;
+
+    if (later >= earlier) {
+        return later - earlier;
+    }
+
+    return (wrap - earlier) + later;
+}
+
+static pcr_pid_model_t *get_pcr_pid_model(pcr_timing_model_t *model, uint16_t pid)
+{
+    pcr_pid_model_t *empty = NULL;
+    size_t i;
+
+    for (i = 0; i < RECOVERY_ENGINE_MAX_PCR_PIDS; i++) {
+        if (model->pid_models[i].active && model->pid_models[i].pid == pid) {
+            return &model->pid_models[i];
+        }
+        if (!model->pid_models[i].active && empty == NULL) {
+            empty = &model->pid_models[i];
+        }
+    }
+
+    if (empty != NULL) {
+        memset(empty, 0, sizeof(*empty));
+        empty->active = true;
+        empty->pid = pid;
+    }
+
+    return empty;
+}
+
+static void refresh_pcr_summary(recovery_engine_t *engine)
+{
+    int stream_id;
+
+    for (stream_id = 0; stream_id < 2; stream_id++) {
+        double best_bitrate = 0.0;
+        uint32_t best_confidence = 0;
+        size_t i;
+
+        for (i = 0; i < RECOVERY_ENGINE_MAX_PCR_PIDS; i++) {
+            pcr_pid_model_t *pid_model = &engine->pcr_model[stream_id].pid_models[i];
+            if (pid_model->active && pid_model->confidence > best_confidence) {
+                best_confidence = pid_model->confidence;
+                best_bitrate = pid_model->bitrate_bps;
+            }
+        }
+
+        engine->pcr_model[stream_id].confidence = best_confidence;
+        engine->stats->pcr_timing_confidence[stream_id] = best_confidence;
+        engine->stats->pcr_bitrate_bps[stream_id] = best_bitrate;
+    }
+
+    if (engine->pcr_model[0].confidence > 0 && engine->pcr_model[1].confidence > 0) {
+        engine->stats->pcr_delay_ns = engine->pcr_model[1].estimated_delay_ns -
+                                      engine->pcr_model[0].estimated_delay_ns;
+    }
+}
+
+static void update_pcr_timing(recovery_engine_t *engine, int stream_id, const packet_record_t *record)
+{
+    pcr_pid_model_t *pid_model;
+
+    if (!record->has_pcr) {
+        return;
+    }
+
+    pid_model = get_pcr_pid_model(&engine->pcr_model[stream_id], record->pid);
+    if (pid_model == NULL) {
+        return;
+    }
+
+    if (pid_model->confidence > 0) {
+        uint64_t packet_delta = record->stream_index - pid_model->last_stream_index;
+        uint64_t pcr_ticks = pcr_delta(record->pcr_value, pid_model->last_pcr);
+
+        if (packet_delta > 0 && pcr_ticks > 0) {
+            double pcr_seconds = (double)pcr_ticks / 27000000.0;
+            double arrival_delta_ns = (double)(record->arrival_time_ns - pid_model->last_arrival_time_ns);
+            double expected_delta_ns = pcr_seconds * 1000000000.0;
+            double sample_bitrate = ((double)packet_delta * 188.0 * 8.0) / pcr_seconds;
+            double sample_packets_per_second = (double)packet_delta / pcr_seconds;
+            double sample_jitter = arrival_delta_ns > expected_delta_ns
+                                       ? arrival_delta_ns - expected_delta_ns
+                                       : expected_delta_ns - arrival_delta_ns;
+
+            if (pid_model->bitrate_bps == 0.0) {
+                pid_model->bitrate_bps = sample_bitrate;
+                pid_model->packets_per_second = sample_packets_per_second;
+                pid_model->jitter_ns = sample_jitter;
+            } else {
+                pid_model->bitrate_bps = (pid_model->bitrate_bps * 0.875) + (sample_bitrate * 0.125);
+                pid_model->packets_per_second = (pid_model->packets_per_second * 0.875) +
+                                                (sample_packets_per_second * 0.125);
+                pid_model->jitter_ns = (pid_model->jitter_ns * 0.875) + (sample_jitter * 0.125);
+            }
+
+            if (pid_model->confidence < 100) {
+                pid_model->confidence += 4;
+                if (pid_model->confidence > 100) {
+                    pid_model->confidence = 100;
+                }
+            }
+        }
+    } else {
+        pid_model->confidence = 1;
+    }
+
+    pid_model->last_pcr = record->pcr_value;
+    pid_model->last_stream_index = record->stream_index;
+    pid_model->last_arrival_time_ns = record->arrival_time_ns;
+
+    if (pid_model->packets_per_second > 0.0) {
+        engine->pcr_model[stream_id].estimated_delay_ns =
+            ((double)record->stream_index / pid_model->packets_per_second * 1000000000.0) -
+            (double)record->arrival_time_ns;
+    }
+
+    refresh_pcr_summary(engine);
+}
+
 static int score_alignment_match(const packet_record_t *record, const packet_record_t *candidate)
 {
     int score = 0;
@@ -252,9 +381,11 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
     record->has_pcr = info->has_pcr;
     record->is_null = info->is_null;
     record->transport_error = info->transport_error;
+    record->pcr_value = info->has_pcr ? packet_info_pcr_value(info) : 0;
     record->hash = hash_packet(packet);
     memcpy(record->packet, packet, TS_PACKET_SIZE);
 
+    update_pcr_timing(engine, stream_id, record);
     update_alignment(engine, stream_id, record);
 
     if (stream_id == 0 && primary_delay_queue_push(&engine->primary_queue, record) != 0) {

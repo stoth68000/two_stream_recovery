@@ -13,6 +13,7 @@
 #define RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS 2048
 #define RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD 8
 #define RECOVERY_ENGINE_DEFAULT_DELAY_NS 2500000000ULL
+#define RECOVERY_ENGINE_MAX_PCR_PIDS 32
 
 typedef struct alignment_state {
     bool has_alignment;
@@ -31,6 +32,7 @@ typedef struct packet_record {
     bool has_pcr;
     bool is_null;
     bool transport_error;
+    uint64_t pcr_value;
     uint64_t hash;
     uint8_t packet[TS_PACKET_SIZE];
 } packet_record_t;
@@ -50,11 +52,30 @@ typedef struct primary_delay_queue {
     uint64_t delay_ns;
 } primary_delay_queue_t;
 
+typedef struct pcr_pid_model {
+    bool active;
+    uint16_t pid;
+    uint64_t last_pcr;
+    uint64_t last_stream_index;
+    uint64_t last_arrival_time_ns;
+    double bitrate_bps;
+    double packets_per_second;
+    double jitter_ns;
+    uint32_t confidence;
+} pcr_pid_model_t;
+
+typedef struct pcr_timing_model {
+    pcr_pid_model_t pid_models[RECOVERY_ENGINE_MAX_PCR_PIDS];
+    double estimated_delay_ns;
+    uint32_t confidence;
+} pcr_timing_model_t;
+
 typedef struct recovery_engine {
     output_udp_t *output;
     report_stats_t *stats;
     packet_history_t history[2];
     primary_delay_queue_t primary_queue;
+    pcr_timing_model_t pcr_model[2];
     uint64_t next_stream_index[2];
     alignment_state_t alignment;
 } recovery_engine_t;

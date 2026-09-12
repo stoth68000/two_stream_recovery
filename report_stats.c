@@ -86,6 +86,7 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            "tei=[%" PRIu64 ",%" PRIu64 "] cc_errors=[%" PRIu64 ",%" PRIu64 "] "
            "duplicate_cc=[%" PRIu64 ",%" PRIu64 "] null=[%" PRIu64 ",%" PRIu64 "] "
            "pcr=[%" PRIu64 ",%" PRIu64 "] align_offset=%" PRId64 " align_confidence=%u "
+           "pcr_confidence=[%u,%u] pcr_bitrate_bps=[%.0f,%.0f] pcr_delay_ns=%.0f "
            "disagreements=%" PRIu64 " delay_overflows=%" PRIu64 " recovered=%" PRIu64 " unrecoverable=%" PRIu64
            " output=%" PRIu64 "\n",
            timestamp,
@@ -97,6 +98,8 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            stats->null_packets[0], stats->null_packets[1],
            stats->pcr_packets[0], stats->pcr_packets[1],
            stats->alignment_offset_packets, stats->alignment_confidence,
+           stats->pcr_timing_confidence[0], stats->pcr_timing_confidence[1],
+           stats->pcr_bitrate_bps[0], stats->pcr_bitrate_bps[1], stats->pcr_delay_ns,
            stats->stream_disagreements, stats->primary_delay_overflows,
            stats->recovered_packets, stats->unrecoverable_loss, stats->output_packets);
     fflush(stdout);
