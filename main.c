@@ -17,6 +17,12 @@
 
 static volatile sig_atomic_t should_stop = 0;
 
+typedef struct command_line_options {
+    const char *input_primary_url;
+    const char *input_secondary_url;
+    const char *output_url;
+} command_line_options_t;
+
 static void handle_signal(int signum)
 {
     (void)signum;
@@ -120,34 +126,90 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
     return 0;
 }
 
+static void print_usage(const char *program_name)
+{
+    fprintf(stderr,
+            "usage: %s --input-primary-url <url> --input-secondary-url <url> [--output-url <url>]\n",
+            program_name);
+}
+
+static int parse_command_line(int argc, char **argv, command_line_options_t *options)
+{
+    int i;
+
+    memset(options, 0, sizeof(*options));
+    options->output_url = DEFAULT_OUTPUT_URL;
+
+    for (i = 1; i < argc; i++) {
+        const char *name = argv[i];
+        const char **target = NULL;
+
+        if (strcmp(name, "--input-primary-url") == 0) {
+            target = &options->input_primary_url;
+        } else if (strcmp(name, "--input-secondary-url") == 0) {
+            target = &options->input_secondary_url;
+        } else if (strcmp(name, "--output-url") == 0) {
+            target = &options->output_url;
+        } else if (strcmp(name, "--help") == 0 || strcmp(name, "-h") == 0) {
+            print_usage(argv[0]);
+            return 1;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", name);
+            print_usage(argv[0]);
+            return -1;
+        }
+
+        if (i + 1 >= argc) {
+            fprintf(stderr, "missing value for option: %s\n", name);
+            print_usage(argv[0]);
+            return -1;
+        }
+
+        if (*target != NULL && target != &options->output_url) {
+            fprintf(stderr, "duplicate option: %s\n", name);
+            print_usage(argv[0]);
+            return -1;
+        }
+
+        *target = argv[++i];
+    }
+
+    if (options->input_primary_url == NULL || options->input_secondary_url == NULL) {
+        fprintf(stderr, "both input URLs are required\n");
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     input_udp_t inputs[2];
     output_udp_t output;
-    const char *output_url = DEFAULT_OUTPUT_URL;
+    command_line_options_t options;
+    int parse_result;
     int result = EXIT_FAILURE;
 
-    if (argc < 3 || argc > 4) {
-        fprintf(stderr, "usage: %s udp://<bind-ip>:<port> udp://<bind-ip>:<port> [udp://<dst-ip>:<port>]\n",
-                argv[0]);
-        return EXIT_FAILURE;
+    parse_result = parse_command_line(argc, argv, &options);
+    if (parse_result > 0) {
+        return EXIT_SUCCESS;
     }
-
-    if (argc == 4) {
-        output_url = argv[3];
+    if (parse_result < 0) {
+        return EXIT_FAILURE;
     }
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    if (input_udp_open(&inputs[0], argv[1]) != 0) {
+    if (input_udp_open(&inputs[0], options.input_primary_url) != 0) {
         return EXIT_FAILURE;
     }
-    if (input_udp_open(&inputs[1], argv[2]) != 0) {
+    if (input_udp_open(&inputs[1], options.input_secondary_url) != 0) {
         input_udp_close(&inputs[0]);
         return EXIT_FAILURE;
     }
-    if (output_udp_open(&output, output_url) != 0) {
+    if (output_udp_open(&output, options.output_url) != 0) {
         input_udp_close(&inputs[1]);
         input_udp_close(&inputs[0]);
         return EXIT_FAILURE;
