@@ -38,7 +38,7 @@ static int process_datagram(recovery_engine_t *engine, report_stats_t *stats, in
         }
 
         report_stats_observe_packet(stats, stream_id, &info);
-        if (recovery_engine_push_packet(engine, stream_id, packet) != 0) {
+        if (recovery_engine_push_packet(engine, stream_id, packet, &info) != 0) {
             return -1;
         }
     }
@@ -57,7 +57,10 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
     recovery_engine_t engine;
 
     report_stats_init(&stats);
-    recovery_engine_init(&engine, output, &stats);
+    if (recovery_engine_init(&engine, output, &stats) != 0) {
+        fprintf(stderr, "failed to initialize recovery engine\n");
+        return -1;
+    }
 
     while (!should_stop) {
         fd_set read_fds;
@@ -82,6 +85,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
                 continue;
             }
             perror("select");
+            recovery_engine_free(&engine);
             return -1;
         }
 
@@ -90,10 +94,12 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
                 ssize_t received = input_udp_receive(&inputs[i], buffer, sizeof(buffer));
                 if (received < 0) {
                     perror("recv");
+                    recovery_engine_free(&engine);
                     return -1;
                 }
                 if (received > 0 &&
                     process_datagram(&engine, &stats, i, buffer, (size_t)received) != 0) {
+                    recovery_engine_free(&engine);
                     return -1;
                 }
             }
@@ -104,6 +110,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
 
     recovery_engine_flush(&engine);
     report_stats_maybe_print(&stats, true);
+    recovery_engine_free(&engine);
     return 0;
 }
 
