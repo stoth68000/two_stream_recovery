@@ -23,6 +23,9 @@ typedef struct report_stats {
     uint64_t recovered_content_packets;
     uint64_t recovered_content_bursts;
     uint64_t unrecoverable_null_regions;
+    uint64_t secondary_loss_events;
+    uint64_t secondary_missing_packets;
+    uint64_t secondary_missing_anchors;
     uint32_t pcr_timing_confidence[REPORT_STATS_STREAMS];
     double pcr_bitrate_bps[REPORT_STATS_STREAMS];
     double pcr_delay_ns;

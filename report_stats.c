@@ -90,6 +90,8 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            "disagreements=%" PRIu64 " delay_overflows=%" PRIu64 " recovered_null=%" PRIu64
            "recovered_content=%" PRIu64 " recovered_bursts=%" PRIu64
            " unrecoverable_null_regions=%" PRIu64
+           " secondary_loss_events=%" PRIu64 " secondary_missing_packets=%" PRIu64
+           " secondary_missing_anchors=%" PRIu64
            " recovered=%" PRIu64 " unrecoverable=%" PRIu64
            " output=%" PRIu64 "\n",
            timestamp,
@@ -106,6 +108,8 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            stats->stream_disagreements, stats->primary_delay_overflows,
            stats->recovered_null_packets, stats->recovered_content_packets,
            stats->recovered_content_bursts, stats->unrecoverable_null_regions,
+           stats->secondary_loss_events, stats->secondary_missing_packets,
+           stats->secondary_missing_anchors,
            stats->recovered_packets, stats->unrecoverable_loss, stats->output_packets);
     fflush(stdout);
 
