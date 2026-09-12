@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,17 +24,56 @@ static void handle_signal(int signum)
     should_stop = 1;
 }
 
+static bool has_sync_run(const uint8_t *buffer, size_t bytes, size_t offset)
+{
+    size_t i;
+
+    for (i = 0; i < 4; i++) {
+        size_t sync_offset = offset + (i * TS_PACKET_SIZE);
+        if (sync_offset >= bytes || buffer[sync_offset] != TS_SYNC_BYTE) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool find_resync_offset(const uint8_t *buffer, size_t bytes, size_t start_offset,
+                               size_t *resync_offset)
+{
+    size_t offset;
+
+    for (offset = start_offset + 1U; offset < bytes; offset++) {
+        if (has_sync_run(buffer, bytes, offset)) {
+            *resync_offset = offset;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static int process_datagram(recovery_engine_t *engine, report_stats_t *stats, int stream_id,
                             const uint8_t *buffer, size_t bytes)
 {
     size_t offset;
+
+    report_stats_observe_datagram(stats, stream_id, bytes);
 
     for (offset = 0; offset + TS_PACKET_SIZE <= bytes; offset += TS_PACKET_SIZE) {
         const uint8_t *packet = buffer + offset;
         ts_packet_info_t info;
 
         if (!ts_packet_parse(packet, &info)) {
+            size_t resync_offset;
+
             stats->sync_errors[stream_id]++;
+            stats->malformed_datagrams[stream_id]++;
+            if (find_resync_offset(buffer, bytes, offset, &resync_offset)) {
+                stats->resync_events[stream_id]++;
+                offset = resync_offset - TS_PACKET_SIZE;
+                continue;
+            }
             continue;
         }
 
@@ -45,6 +85,7 @@ static int process_datagram(recovery_engine_t *engine, report_stats_t *stats, in
 
     if (offset != bytes) {
         stats->sync_errors[stream_id]++;
+        stats->partial_datagrams[stream_id]++;
     }
 
     return 0;

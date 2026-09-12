@@ -15,13 +15,18 @@
 #define RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS 2500000000ULL
 #define RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS 5000000000ULL
 #define RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS 6000000000ULL
+#define RECOVERY_ENGINE_DEFAULT_HISTORY_MS 6000ULL
+#define RECOVERY_ENGINE_DEFAULT_MIN_ALIGNMENT_CONFIDENCE 40U
 #define RECOVERY_ENGINE_MAX_PCR_PIDS 32
-#define RECOVERY_ENGINE_MAX_CONTENT_BURST_PACKETS 15
+#define RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS 15U
 
 typedef struct recovery_engine_config {
     uint64_t primary_delay_ns;
     uint64_t max_secondary_latency_ns;
     uint64_t alignment_window_ns;
+    uint64_t history_ms;
+    uint32_t min_alignment_confidence;
+    uint32_t max_content_burst_packets;
 } recovery_engine_config_t;
 
 typedef struct alignment_state {

@@ -47,13 +47,28 @@ void command_line_print_usage(const char *program_name)
             "      Arrival-time search window used when comparing packets for stream alignment.\n"
             "      Default: %llu\n"
             "\n"
+            "  --history-ms <ms>\n"
+            "      Rolling packet history target, used to size primary and secondary buffers.\n"
+            "      Default: %llu\n"
+            "\n"
+            "  --max-content-burst-packets <count>\n"
+            "      Maximum content packets to recover in one conservative burst.\n"
+            "      Default: %u\n"
+            "\n"
+            "  --min-alignment-confidence <0-100>\n"
+            "      Minimum alignment confidence required before content recovery.\n"
+            "      Default: %u\n"
+            "\n"
             "  -h, --help\n"
             "      Show this help page.\n",
             program_name,
             DEFAULT_OUTPUT_URL,
             (unsigned long long)(defaults.primary_delay_ns / 1000000ULL),
             (unsigned long long)(defaults.max_secondary_latency_ns / 1000000ULL),
-            (unsigned long long)(defaults.alignment_window_ns / 1000000ULL));
+            (unsigned long long)(defaults.alignment_window_ns / 1000000ULL),
+            (unsigned long long)defaults.history_ms,
+            defaults.max_content_burst_packets,
+            defaults.min_alignment_confidence);
 }
 
 static int parse_u64_ms_option(const char *name, const char *value, uint64_t *target_ns,
@@ -76,6 +91,41 @@ static int parse_u64_ms_option(const char *name, const char *value, uint64_t *ta
     return 0;
 }
 
+static int parse_u64_option(const char *name, const char *value, uint64_t *target,
+                            bool print_errors)
+{
+    unsigned long long parsed;
+    char *end = NULL;
+
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        if (print_errors) {
+            fprintf(stderr, "invalid integer value for %s: %s\n", name, value);
+        }
+        return -1;
+    }
+
+    *target = (uint64_t)parsed;
+    return 0;
+}
+
+static int parse_u32_option(const char *name, const char *value, uint32_t *target,
+                            uint32_t max_value, bool print_errors)
+{
+    uint64_t parsed;
+
+    if (parse_u64_option(name, value, &parsed, print_errors) != 0 || parsed > max_value) {
+        if (print_errors) {
+            fprintf(stderr, "invalid bounded integer value for %s: %s\n", name, value);
+        }
+        return -1;
+    }
+
+    *target = (uint32_t)parsed;
+    return 0;
+}
+
 static int command_line_parse_internal(int argc, char **argv, command_line_options_t *options,
                                        bool print_errors)
 {
@@ -89,6 +139,9 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
         const char *name = argv[i];
         const char **target = NULL;
         uint64_t *ms_target_ns = NULL;
+        uint64_t *u64_target = NULL;
+        uint32_t *u32_target = NULL;
+        uint32_t u32_max = UINT32_MAX;
 
         if (strcmp(name, "--input-primary-url") == 0) {
             target = &options->input_primary_url;
@@ -106,6 +159,14 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
             ms_target_ns = &options->recovery_config.max_secondary_latency_ns;
         } else if (strcmp(name, "--alignment-window-ms") == 0) {
             ms_target_ns = &options->recovery_config.alignment_window_ns;
+        } else if (strcmp(name, "--history-ms") == 0) {
+            u64_target = &options->recovery_config.history_ms;
+        } else if (strcmp(name, "--max-content-burst-packets") == 0) {
+            u32_target = &options->recovery_config.max_content_burst_packets;
+            u32_max = 255U;
+        } else if (strcmp(name, "--min-alignment-confidence") == 0) {
+            u32_target = &options->recovery_config.min_alignment_confidence;
+            u32_max = 100U;
         } else if (strcmp(name, "--help") == 0 || strcmp(name, "-h") == 0) {
             if (print_errors) {
                 command_line_print_usage(argv[0]);
@@ -129,6 +190,24 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
 
         if (ms_target_ns != NULL) {
             if (parse_u64_ms_option(name, argv[++i], ms_target_ns, print_errors) != 0) {
+                if (print_errors) {
+                    command_line_print_usage(argv[0]);
+                }
+                return -1;
+            }
+            continue;
+        }
+        if (u64_target != NULL) {
+            if (parse_u64_option(name, argv[++i], u64_target, print_errors) != 0) {
+                if (print_errors) {
+                    command_line_print_usage(argv[0]);
+                }
+                return -1;
+            }
+            continue;
+        }
+        if (u32_target != NULL) {
+            if (parse_u32_option(name, argv[++i], u32_target, u32_max, print_errors) != 0) {
                 if (print_errors) {
                     command_line_print_usage(argv[0]);
                 }

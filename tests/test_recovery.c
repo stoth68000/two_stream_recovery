@@ -136,7 +136,10 @@ static void test_command_line_parse(void)
         "--output-url", "udp://127.0.0.1:4501",
         "--primary-delay-ms", "3000",
         "--max-secondary-latency-ms", "7000",
-        "--alignment-window-ms", "9000"
+        "--alignment-window-ms", "9000",
+        "--history-ms", "12000",
+        "--max-content-burst-packets", "25",
+        "--min-alignment-confidence", "55"
     };
     char *defaults[] = {
         "two_stream_recovery",
@@ -159,6 +162,18 @@ static void test_command_line_parse(void)
         "--input-secondary-url", "udp://127.0.0.1:5001",
         "--primary-delay-ms", "12x"
     };
+    char *invalid_confidence[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://127.0.0.1:5000",
+        "--input-secondary-url", "udp://127.0.0.1:5001",
+        "--min-alignment-confidence", "101"
+    };
+    char *invalid_burst[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://127.0.0.1:5000",
+        "--input-secondary-url", "udp://127.0.0.1:5001",
+        "--max-content-burst-packets", "300"
+    };
     char *duplicate_primary[] = {
         "two_stream_recovery",
         "--input-primary-url", "udp://127.0.0.1:5000",
@@ -176,6 +191,9 @@ static void test_command_line_parse(void)
     assert(options.recovery_config.primary_delay_ns == 3000000000ULL);
     assert(options.recovery_config.max_secondary_latency_ns == 7000000000ULL);
     assert(options.recovery_config.alignment_window_ns == 9000000000ULL);
+    assert(options.recovery_config.history_ms == 12000ULL);
+    assert(options.recovery_config.max_content_burst_packets == 25U);
+    assert(options.recovery_config.min_alignment_confidence == 55U);
 
     assert(command_line_parse((int)(sizeof(defaults) / sizeof(defaults[0])), defaults, &options) == 0);
     assert(strcmp(options.output_url, DEFAULT_OUTPUT_URL) == 0);
@@ -183,11 +201,20 @@ static void test_command_line_parse(void)
     assert(options.recovery_config.max_secondary_latency_ns ==
            RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS);
     assert(options.recovery_config.alignment_window_ns == RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS);
+    assert(options.recovery_config.history_ms == RECOVERY_ENGINE_DEFAULT_HISTORY_MS);
+    assert(options.recovery_config.max_content_burst_packets ==
+           RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS);
+    assert(options.recovery_config.min_alignment_confidence ==
+           RECOVERY_ENGINE_DEFAULT_MIN_ALIGNMENT_CONFIDENCE);
 
     assert(command_line_parse_silent((int)(sizeof(missing_secondary) / sizeof(missing_secondary[0])),
                                      missing_secondary, &options) < 0);
     assert(command_line_parse_silent((int)(sizeof(unknown) / sizeof(unknown[0])), unknown, &options) < 0);
     assert(command_line_parse_silent((int)(sizeof(invalid_ms) / sizeof(invalid_ms[0])), invalid_ms, &options) < 0);
+    assert(command_line_parse_silent((int)(sizeof(invalid_confidence) / sizeof(invalid_confidence[0])),
+                                     invalid_confidence, &options) < 0);
+    assert(command_line_parse_silent((int)(sizeof(invalid_burst) / sizeof(invalid_burst[0])),
+                                     invalid_burst, &options) < 0);
     assert(command_line_parse_silent((int)(sizeof(duplicate_primary) / sizeof(duplicate_primary[0])),
                                      duplicate_primary, &options) < 0);
     assert(command_line_parse_silent((int)(sizeof(help) / sizeof(help[0])), help, &options) > 0);
@@ -285,6 +312,9 @@ static void test_recovery_engine_config(void)
     config.primary_delay_ns = 123000000ULL;
     config.max_secondary_latency_ns = 456000000ULL;
     config.alignment_window_ns = 789000000ULL;
+    config.history_ms = 12000ULL;
+    config.max_content_burst_packets = 255U;
+    config.min_alignment_confidence = 101U;
 
     memset(&capture, 0, sizeof(capture));
     report_stats_init(&stats);
@@ -293,6 +323,10 @@ static void test_recovery_engine_config(void)
     assert(engine.config.primary_delay_ns == 123000000ULL);
     assert(engine.config.max_secondary_latency_ns == 456000000ULL);
     assert(engine.config.alignment_window_ns == 789000000ULL);
+    assert(engine.config.history_ms == 12000ULL);
+    assert(engine.config.max_content_burst_packets == 255U);
+    assert(engine.config.min_alignment_confidence == 100U);
+    assert(engine.history[0].capacity > RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS);
     recovery_engine_free(&engine);
 }
 
