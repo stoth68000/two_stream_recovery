@@ -20,6 +20,8 @@ static volatile sig_atomic_t should_stop = 0;
 typedef struct command_line_options {
     const char *input_primary_url;
     const char *input_secondary_url;
+    const char *input_primary_interface;
+    const char *input_secondary_interface;
     const char *output_url;
     recovery_engine_config_t recovery_config;
 } command_line_options_t;
@@ -139,9 +141,19 @@ static void print_usage(const char *program_name)
             "Options:\n"
             "  --input-primary-url <url>\n"
             "      Required. UDP URL for stream #1, the preferred source of truth.\n"
+            "      Multicast group URLs automatically join the group with IGMP.\n"
             "\n"
             "  --input-secondary-url <url>\n"
             "      Required. UDP URL for stream #2, the delayed recovery witness.\n"
+            "      Multicast group URLs automatically join the group with IGMP.\n"
+            "\n"
+            "  --input-primary-interface <ipv4>\n"
+            "      Local interface IPv4 address used when joining the primary multicast group.\n"
+            "      Default: 0.0.0.0\n"
+            "\n"
+            "  --input-secondary-interface <ipv4>\n"
+            "      Local interface IPv4 address used when joining the secondary multicast group.\n"
+            "      Default: 0.0.0.0\n"
             "\n"
             "  --output-url <url>\n"
             "      UDP destination for recovered output. Default: %s\n"
@@ -201,6 +213,10 @@ static int parse_command_line(int argc, char **argv, command_line_options_t *opt
             target = &options->input_primary_url;
         } else if (strcmp(name, "--input-secondary-url") == 0) {
             target = &options->input_secondary_url;
+        } else if (strcmp(name, "--input-primary-interface") == 0) {
+            target = &options->input_primary_interface;
+        } else if (strcmp(name, "--input-secondary-interface") == 0) {
+            target = &options->input_secondary_interface;
         } else if (strcmp(name, "--output-url") == 0) {
             target = &options->output_url;
         } else if (strcmp(name, "--primary-delay-ms") == 0) {
@@ -269,10 +285,12 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    if (input_udp_open(&inputs[0], options.input_primary_url) != 0) {
+    if (input_udp_open_with_interface(&inputs[0], options.input_primary_url,
+                                      options.input_primary_interface) != 0) {
         return EXIT_FAILURE;
     }
-    if (input_udp_open(&inputs[1], options.input_secondary_url) != 0) {
+    if (input_udp_open_with_interface(&inputs[1], options.input_secondary_url,
+                                      options.input_secondary_interface) != 0) {
         input_udp_close(&inputs[0]);
         return EXIT_FAILURE;
     }
