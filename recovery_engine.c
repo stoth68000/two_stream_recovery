@@ -423,35 +423,63 @@ static int recover_nulls_before_primary(recovery_engine_t *engine, const packet_
     return 0;
 }
 
-static int recover_single_content_before_primary(recovery_engine_t *engine, const packet_record_t *primary,
-                                                 const packet_record_t *secondary_match)
+static int recover_content_burst_before_primary(recovery_engine_t *engine, const packet_record_t *primary,
+                                                const packet_record_t *secondary_match)
 {
     uint8_t expected_counter;
     uint8_t missing_count;
     uint64_t index;
+    packet_record_t *candidates[RECOVERY_ENGINE_MAX_CONTENT_BURST_PACKETS];
+    uint8_t found = 0;
+    uint8_t next_counter;
 
     if (!engine->last_primary_anchor.valid || secondary_match == NULL || engine->alignment.confidence < 40 ||
-        !continuity_gap_for_record(engine, primary, &expected_counter, &missing_count) || missing_count != 1 ||
+        !continuity_gap_for_record(engine, primary, &expected_counter, &missing_count) ||
+        missing_count > RECOVERY_ENGINE_MAX_CONTENT_BURST_PACKETS ||
         secondary_match->stream_index <= engine->last_primary_anchor.secondary_index) {
         return 0;
     }
 
+    next_counter = expected_counter;
     for (index = engine->last_primary_anchor.secondary_index + 1ULL; index < secondary_match->stream_index; index++) {
         packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
 
-        if (candidate != NULL && !candidate->is_null && !candidate->transport_error &&
-            !candidate->discontinuity_indicator && candidate->pid == primary->pid &&
-            candidate->continuity_counter == expected_counter && candidate->has_payload) {
-            if (output_record(engine, candidate) != 0) {
-                return -1;
-            }
-            engine->stats->recovered_packets++;
-            engine->stats->recovered_content_packets++;
+        if (candidate == NULL || candidate->transport_error || candidate->discontinuity_indicator) {
+            engine->stats->unrecoverable_loss++;
             return 0;
         }
+
+        if (candidate->is_null) {
+            continue;
+        }
+
+        if (candidate->pid != primary->pid || !candidate->has_payload ||
+            candidate->continuity_counter != next_counter || found >= missing_count) {
+            engine->stats->unrecoverable_loss++;
+            return 0;
+        }
+
+        candidates[found++] = candidate;
+        next_counter = (uint8_t)((next_counter + 1U) & 0x0fU);
     }
 
-    engine->stats->unrecoverable_loss++;
+    if (found != missing_count) {
+        engine->stats->unrecoverable_loss++;
+        return 0;
+    }
+
+    for (index = 0; index < found; index++) {
+        if (output_record(engine, candidates[index]) != 0) {
+            return -1;
+        }
+        engine->stats->recovered_packets++;
+        engine->stats->recovered_content_packets++;
+    }
+
+    if (found > 1) {
+        engine->stats->recovered_content_bursts++;
+    }
+
     return 0;
 }
 
@@ -606,7 +634,7 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             return -1;
         }
 
-        if (recover_single_content_before_primary(engine, record, secondary_match) != 0) {
+        if (recover_content_burst_before_primary(engine, record, secondary_match) != 0) {
             return -1;
         }
 
