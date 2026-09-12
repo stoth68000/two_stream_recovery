@@ -78,6 +78,18 @@ static void make_pcr_packet(uint8_t packet[TS_PACKET_SIZE], uint16_t pid, uint8_
     packet[11] = 0;
 }
 
+static void mark_transport_error(uint8_t packet[TS_PACKET_SIZE])
+{
+    packet[1] |= 0x80U;
+}
+
+static void mark_discontinuity(uint8_t packet[TS_PACKET_SIZE])
+{
+    packet[3] = (uint8_t)(0x30U | (packet[3] & 0x0fU));
+    packet[4] = 1;
+    packet[5] = 0x80;
+}
+
 static void push_packet(recovery_engine_t *engine, report_stats_t *stats, int stream_id,
                         const uint8_t packet[TS_PACKET_SIZE])
 {
@@ -247,6 +259,319 @@ static void test_secondary_loss_diagnosis(void)
     recovery_engine_free(&engine);
 }
 
+static void test_generated_content_recovery_sweep(void)
+{
+    uint16_t pids[] = {0x0100, 0x0101, 0x0110, 0x0120, 0x0130, 0x0140, 0x01f0, 0x0200};
+    size_t pid_index;
+    unsigned gap;
+    unsigned scenarios = 0;
+
+    for (pid_index = 0; pid_index < sizeof(pids) / sizeof(pids[0]); pid_index++) {
+        for (gap = 1; gap <= 14; gap++) {
+            recovery_engine_t engine;
+            report_stats_t stats;
+            capture_sink_t capture;
+            packet_sink_t sink;
+            uint8_t primary_anchor[TS_PACKET_SIZE];
+            uint8_t secondary_anchor[TS_PACKET_SIZE];
+            uint8_t expected_gap[14][TS_PACKET_SIZE];
+            size_t i;
+
+            init_engine(&engine, &stats, &capture, &sink);
+            for (i = 0; i < 12; i++) {
+                push_pair(&engine, &stats, pids[pid_index], (uint8_t)i,
+                          (uint8_t)(0x20 + pid_index + i));
+            }
+            assert(recovery_engine_flush(&engine) == 0);
+
+            for (i = 0; i < gap; i++) {
+                make_packet(expected_gap[i], pids[pid_index], (uint8_t)(12 + i),
+                            (uint8_t)(0x50 + gap + i));
+                push_packet(&engine, &stats, 1, expected_gap[i]);
+            }
+
+            make_packet(primary_anchor, pids[pid_index], (uint8_t)(12 + gap),
+                        (uint8_t)(0x80 + gap));
+            make_packet(secondary_anchor, pids[pid_index], (uint8_t)(12 + gap),
+                        (uint8_t)(0x80 + gap));
+            push_packet(&engine, &stats, 0, primary_anchor);
+            push_packet(&engine, &stats, 1, secondary_anchor);
+
+            assert(recovery_engine_flush(&engine) == 0);
+            assert(capture.packet_count == 13 + gap);
+            assert(stats.recovered_content_packets == gap);
+            assert(stats.recovered_packets == gap);
+            if (gap > 1) {
+                assert(stats.recovered_content_bursts == 1);
+            }
+            for (i = 0; i < gap; i++) {
+                assert(memcmp(capture.packets[12 + i], expected_gap[i], TS_PACKET_SIZE) == 0);
+            }
+            assert(memcmp(capture.packets[12 + gap], primary_anchor, TS_PACKET_SIZE) == 0);
+            recovery_engine_free(&engine);
+            scenarios++;
+        }
+    }
+
+    assert(scenarios == 112);
+}
+
+static void test_generated_ambiguous_recovery_sweep(void)
+{
+    enum {
+        BAD_TEI = 0,
+        BAD_DISCONTINUITY,
+        BAD_PID,
+        BAD_COUNTER,
+        BAD_EXTRA_CONTENT,
+        BAD_CASES
+    };
+    uint16_t pids[] = {0x0100, 0x0101, 0x0121, 0x0200, 0x0330};
+    size_t pid_index;
+    int bad_case;
+    unsigned scenarios = 0;
+
+    for (pid_index = 0; pid_index < sizeof(pids) / sizeof(pids[0]); pid_index++) {
+        for (bad_case = 0; bad_case < BAD_CASES; bad_case++) {
+            recovery_engine_t engine;
+            report_stats_t stats;
+            capture_sink_t capture;
+            packet_sink_t sink;
+            uint8_t candidate[TS_PACKET_SIZE];
+            uint8_t primary_anchor[TS_PACKET_SIZE];
+            uint8_t secondary_anchor[TS_PACKET_SIZE];
+            size_t i;
+
+            init_engine(&engine, &stats, &capture, &sink);
+            for (i = 0; i < 12; i++) {
+                push_pair(&engine, &stats, pids[pid_index], (uint8_t)i,
+                          (uint8_t)(0x31 + pid_index + i));
+            }
+            assert(recovery_engine_flush(&engine) == 0);
+
+            make_packet(candidate, pids[pid_index], 12, (uint8_t)(0xa0 + bad_case));
+            if (bad_case == BAD_TEI) {
+                mark_transport_error(candidate);
+            } else if (bad_case == BAD_DISCONTINUITY) {
+                mark_discontinuity(candidate);
+            } else if (bad_case == BAD_PID) {
+                make_packet(candidate, (uint16_t)(pids[pid_index] + 0x20U), 12, 0xa2);
+            } else if (bad_case == BAD_COUNTER) {
+                make_packet(candidate, pids[pid_index], 14, 0xa3);
+            }
+            push_packet(&engine, &stats, 1, candidate);
+
+            if (bad_case == BAD_EXTRA_CONTENT) {
+                make_packet(candidate, (uint16_t)(pids[pid_index] + 0x40U), 3, 0xa4);
+                push_packet(&engine, &stats, 1, candidate);
+            }
+
+            make_packet(primary_anchor, pids[pid_index], 13, 0xb0);
+            make_packet(secondary_anchor, pids[pid_index], 13, 0xb0);
+            push_packet(&engine, &stats, 0, primary_anchor);
+            push_packet(&engine, &stats, 1, secondary_anchor);
+
+            assert(recovery_engine_flush(&engine) == 0);
+            assert(capture.packet_count == 13);
+            assert(memcmp(capture.packets[12], primary_anchor, TS_PACKET_SIZE) == 0);
+            assert(stats.recovered_content_packets == 0);
+            assert(stats.recovered_packets == 0);
+            assert(stats.unrecoverable_loss >= 1);
+            recovery_engine_free(&engine);
+            scenarios++;
+        }
+    }
+
+    assert(scenarios == 25);
+}
+
+static void test_generated_null_recovery_sweep(void)
+{
+    uint16_t pids[] = {0x0100, 0x0101, 0x0110, 0x0120, 0x0130, 0x0140, 0x01f0, 0x0200};
+    size_t pid_index;
+    unsigned nulls;
+    unsigned scenarios = 0;
+
+    for (pid_index = 0; pid_index < sizeof(pids) / sizeof(pids[0]); pid_index++) {
+        for (nulls = 1; nulls <= 12; nulls++) {
+            recovery_engine_t engine;
+            report_stats_t stats;
+            capture_sink_t capture;
+            packet_sink_t sink;
+            uint8_t primary_anchor[TS_PACKET_SIZE];
+            uint8_t secondary_anchor[TS_PACKET_SIZE];
+            uint8_t expected_nulls[12][TS_PACKET_SIZE];
+            size_t i;
+
+            init_engine(&engine, &stats, &capture, &sink);
+            for (i = 0; i < 12; i++) {
+                push_pair(&engine, &stats, pids[pid_index], (uint8_t)i,
+                          (uint8_t)(0x42 + pid_index + i));
+            }
+            assert(recovery_engine_flush(&engine) == 0);
+
+            for (i = 0; i < nulls; i++) {
+                make_null_packet(expected_nulls[i], (uint8_t)(0x60 + i));
+                push_packet(&engine, &stats, 1, expected_nulls[i]);
+            }
+
+            make_packet(primary_anchor, pids[pid_index], 12, (uint8_t)(0x90 + nulls));
+            make_packet(secondary_anchor, pids[pid_index], 12, (uint8_t)(0x90 + nulls));
+            push_packet(&engine, &stats, 0, primary_anchor);
+            push_packet(&engine, &stats, 1, secondary_anchor);
+
+            assert(recovery_engine_flush(&engine) == 0);
+            assert(capture.packet_count == 13 + nulls);
+            assert(stats.recovered_null_packets == nulls);
+            assert(stats.recovered_packets == nulls);
+            for (i = 0; i < nulls; i++) {
+                assert(memcmp(capture.packets[12 + i], expected_nulls[i], TS_PACKET_SIZE) == 0);
+            }
+            assert(memcmp(capture.packets[12 + nulls], primary_anchor, TS_PACKET_SIZE) == 0);
+            recovery_engine_free(&engine);
+            scenarios++;
+        }
+    }
+
+    assert(scenarios == 96);
+}
+
+static void test_generated_secondary_loss_sweep(void)
+{
+    uint16_t pids[] = {0x0100, 0x0101, 0x0110, 0x0120, 0x0130, 0x0140, 0x01f0, 0x0200};
+    size_t pid_index;
+    unsigned missing;
+    unsigned scenarios = 0;
+
+    for (pid_index = 0; pid_index < sizeof(pids) / sizeof(pids[0]); pid_index++) {
+        for (missing = 1; missing <= 10; missing++) {
+            recovery_engine_t engine;
+            report_stats_t stats;
+            capture_sink_t capture;
+            packet_sink_t sink;
+            uint8_t primary_only[10][TS_PACKET_SIZE];
+            size_t i;
+
+            init_engine(&engine, &stats, &capture, &sink);
+            for (i = 0; i < 12; i++) {
+                push_pair(&engine, &stats, pids[pid_index], (uint8_t)i,
+                          (uint8_t)(0x18 + pid_index + i));
+            }
+            assert(recovery_engine_flush(&engine) == 0);
+
+            for (i = 0; i < missing; i++) {
+                make_packet(primary_only[i], pids[pid_index], (uint8_t)(12 + i),
+                            (uint8_t)(0xc0 + i));
+                push_packet(&engine, &stats, 0, primary_only[i]);
+            }
+
+            push_pair(&engine, &stats, pids[pid_index], (uint8_t)(12 + missing),
+                      (uint8_t)(0xe0 + missing));
+
+            assert(recovery_engine_flush(&engine) == 0);
+            assert(capture.packet_count == 13 + missing);
+            assert(stats.recovered_packets == 0);
+            assert(stats.secondary_loss_events == 1);
+            assert(stats.secondary_missing_packets == missing);
+            recovery_engine_free(&engine);
+            scenarios++;
+        }
+    }
+
+    assert(scenarios == 80);
+}
+
+static void test_generated_offset_recovery_sweep(void)
+{
+    uint16_t pids[] = {0x0100, 0x0111, 0x0222, 0x0333};
+    size_t pid_index;
+    unsigned offset;
+    unsigned gap;
+    unsigned scenarios = 0;
+
+    for (pid_index = 0; pid_index < sizeof(pids) / sizeof(pids[0]); pid_index++) {
+        for (offset = 1; offset <= 8; offset++) {
+            for (gap = 1; gap <= 5; gap++) {
+                recovery_engine_t engine;
+                report_stats_t stats;
+                capture_sink_t capture;
+                packet_sink_t sink;
+                uint8_t candidate[5][TS_PACKET_SIZE];
+                uint8_t primary_anchor[TS_PACKET_SIZE];
+                uint8_t secondary_anchor[TS_PACKET_SIZE];
+                size_t i;
+
+                init_engine(&engine, &stats, &capture, &sink);
+
+                for (i = 0; i < offset; i++) {
+                    uint8_t prelude[TS_PACKET_SIZE];
+
+                    make_packet(prelude, (uint16_t)(0x0600 + i), (uint8_t)i, (uint8_t)(0x10 + i));
+                    push_packet(&engine, &stats, 1, prelude);
+                }
+
+                for (i = 0; i < 12; i++) {
+                    uint8_t packet[TS_PACKET_SIZE];
+
+                    make_packet(packet, pids[pid_index], (uint8_t)i, (uint8_t)(0x70 + i));
+                    push_packet(&engine, &stats, 0, packet);
+                    push_packet(&engine, &stats, 1, packet);
+                }
+                assert(recovery_engine_flush(&engine) == 0);
+
+                for (i = 0; i < gap; i++) {
+                    make_packet(candidate[i], pids[pid_index], (uint8_t)(12 + i),
+                                (uint8_t)(0x95 + i));
+                    push_packet(&engine, &stats, 1, candidate[i]);
+                }
+
+                make_packet(primary_anchor, pids[pid_index], (uint8_t)(12 + gap), 0xb8);
+                make_packet(secondary_anchor, pids[pid_index], (uint8_t)(12 + gap), 0xb8);
+                push_packet(&engine, &stats, 0, primary_anchor);
+                push_packet(&engine, &stats, 1, secondary_anchor);
+
+                assert(recovery_engine_flush(&engine) == 0);
+                assert(capture.packet_count == 13 + gap);
+                assert(stats.recovered_content_packets == gap);
+                assert(stats.alignment_offset_packets == (int64_t)(offset + gap));
+                for (i = 0; i < gap; i++) {
+                    assert(memcmp(capture.packets[12 + i], candidate[i], TS_PACKET_SIZE) == 0);
+                }
+                assert(memcmp(capture.packets[12 + gap], primary_anchor, TS_PACKET_SIZE) == 0);
+                recovery_engine_free(&engine);
+                scenarios++;
+            }
+        }
+    }
+
+    assert(scenarios == 160);
+}
+
+static void test_generated_parser_sweep(void)
+{
+    uint16_t pid;
+    unsigned continuity_counter;
+    unsigned parsed = 0;
+
+    for (pid = 0; pid < 512; pid += 17) {
+        for (continuity_counter = 0; continuity_counter < 16; continuity_counter++) {
+            uint8_t packet[TS_PACKET_SIZE];
+            ts_packet_info_t info;
+
+            make_packet(packet, pid, (uint8_t)continuity_counter,
+                        (uint8_t)(pid + continuity_counter));
+            assert(ts_packet_parse(packet, &info));
+            assert(info.pid == pid);
+            assert(info.continuity_counter == continuity_counter);
+            assert(info.has_payload);
+            assert(!info.transport_error);
+            parsed++;
+        }
+    }
+
+    assert(parsed == 496);
+}
+
 int main(void)
 {
     test_ts_packet_parse();
@@ -254,6 +579,12 @@ int main(void)
     test_single_packet_recovery();
     test_burst_recovery();
     test_secondary_loss_diagnosis();
+    test_generated_parser_sweep();
+    test_generated_content_recovery_sweep();
+    test_generated_ambiguous_recovery_sweep();
+    test_generated_null_recovery_sweep();
+    test_generated_secondary_loss_sweep();
+    test_generated_offset_recovery_sweep();
     printf("test_recovery: ok\n");
     return 0;
 }
