@@ -10,6 +10,16 @@
 #include <stdbool.h>
 
 #define RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS 65536
+#define RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS 2048
+#define RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD 8
+
+typedef struct alignment_state {
+    bool has_alignment;
+    int64_t offset_packets;
+    uint32_t confidence;
+    uint32_t consecutive_matches;
+    uint32_t consecutive_misses;
+} alignment_state_t;
 
 typedef struct packet_record {
     uint64_t stream_index;
@@ -36,6 +46,7 @@ typedef struct recovery_engine {
     report_stats_t *stats;
     packet_history_t history[2];
     uint64_t next_stream_index[2];
+    alignment_state_t alignment;
 } recovery_engine_t;
 
 int recovery_engine_init(recovery_engine_t *engine, output_udp_t *output, report_stats_t *stats);

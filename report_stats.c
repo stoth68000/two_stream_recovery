@@ -85,7 +85,8 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
     printf("%s packets_rx=[%" PRIu64 ",%" PRIu64 "] sync_errors=[%" PRIu64 ",%" PRIu64 "] "
            "tei=[%" PRIu64 ",%" PRIu64 "] cc_errors=[%" PRIu64 ",%" PRIu64 "] "
            "duplicate_cc=[%" PRIu64 ",%" PRIu64 "] null=[%" PRIu64 ",%" PRIu64 "] "
-           "pcr=[%" PRIu64 ",%" PRIu64 "] recovered=%" PRIu64 " unrecoverable=%" PRIu64
+           "pcr=[%" PRIu64 ",%" PRIu64 "] align_offset=%" PRId64 " align_confidence=%u "
+           "disagreements=%" PRIu64 " recovered=%" PRIu64 " unrecoverable=%" PRIu64
            " output=%" PRIu64 "\n",
            timestamp,
            stats->packets_received[0], stats->packets_received[1],
@@ -95,6 +96,8 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            stats->duplicate_counters[0], stats->duplicate_counters[1],
            stats->null_packets[0], stats->null_packets[1],
            stats->pcr_packets[0], stats->pcr_packets[1],
+           stats->alignment_offset_packets, stats->alignment_confidence,
+           stats->stream_disagreements,
            stats->recovered_packets, stats->unrecoverable_loss, stats->output_packets);
     fflush(stdout);
 

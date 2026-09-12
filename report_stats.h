@@ -17,6 +17,9 @@ typedef struct report_stats {
     uint64_t duplicate_counters[REPORT_STATS_STREAMS];
     uint64_t null_packets[REPORT_STATS_STREAMS];
     uint64_t pcr_packets[REPORT_STATS_STREAMS];
+    uint64_t stream_disagreements;
+    int64_t alignment_offset_packets;
+    uint32_t alignment_confidence;
     uint64_t per_pid_packets[REPORT_STATS_STREAMS][REPORT_STATS_PIDS];
     uint64_t recovered_packets;
     uint64_t unrecoverable_loss;
