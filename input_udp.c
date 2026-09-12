@@ -10,7 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int parse_udp_url(const char *url, char *host, size_t host_size, uint16_t *port)
+int input_udp_parse_url(const char *url, char *host, size_t host_size, uint16_t *port)
 {
     const char *prefix = "udp://";
     const char *address = url;
@@ -51,6 +51,17 @@ static bool is_multicast_address(struct in_addr address)
     return host_order >= 0xe0000000UL && host_order <= 0xefffffffUL;
 }
 
+bool input_udp_is_multicast_host(const char *host)
+{
+    struct in_addr address;
+
+    if (inet_pton(AF_INET, host, &address) != 1) {
+        return false;
+    }
+
+    return is_multicast_address(address);
+}
+
 static int parse_interface_address(const char *interface_address, struct in_addr *address)
 {
     if (interface_address == NULL || interface_address[0] == '\0' ||
@@ -86,7 +97,7 @@ int input_udp_open_with_interface(input_udp_t *input, const char *url, const cha
     memset(input, 0, sizeof(*input));
     input->fd = -1;
 
-    if (parse_udp_url(url, host, sizeof(host), &port) != 0) {
+    if (input_udp_parse_url(url, host, sizeof(host), &port) != 0) {
         fprintf(stderr, "invalid UDP input URL: %s\n", url);
         return -1;
     }

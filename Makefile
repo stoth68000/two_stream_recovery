@@ -3,9 +3,9 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 LDFLAGS ?=
 
 BIN := two_stream_recovery
-OBJS := main.o input_udp.o output_udp.o report_stats.o ts_packet.o recovery_engine.o
+OBJS := main.o command_line.o input_udp.o output_udp.o report_stats.o ts_packet.o recovery_engine.o
 TEST_BIN := tests/test_recovery
-TEST_OBJS := tests/test_recovery.o report_stats.o ts_packet.o recovery_engine.o
+TEST_OBJS := tests/test_recovery.o command_line.o input_udp.o output_udp.o report_stats.o ts_packet.o recovery_engine.o
 
 .PHONY: all clean test
 

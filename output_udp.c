@@ -9,7 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int parse_udp_url(const char *url, char *host, size_t host_size, uint16_t *port)
+int output_udp_parse_url(const char *url, char *host, size_t host_size, uint16_t *port)
 {
     const char *prefix = "udp://";
     const char *address = url;
@@ -56,7 +56,7 @@ int output_udp_open(output_udp_t *output, const char *url)
         return -1;
     }
 
-    if (parse_udp_url(url, host, sizeof(host), &port) != 0) {
+    if (output_udp_parse_url(url, host, sizeof(host), &port) != 0) {
         fprintf(stderr, "invalid UDP output URL: %s\n", url);
         output_udp_close(output);
         return -1;

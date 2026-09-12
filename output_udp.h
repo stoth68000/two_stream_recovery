@@ -17,6 +17,7 @@ typedef struct output_udp {
     size_t pending_packets;
 } output_udp_t;
 
+int output_udp_parse_url(const char *url, char *host, size_t host_size, uint16_t *port);
 int output_udp_open(output_udp_t *output, const char *url);
 int output_udp_send_ts_packet(output_udp_t *output, const uint8_t packet[188]);
 int output_udp_flush(output_udp_t *output);

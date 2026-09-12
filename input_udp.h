@@ -15,6 +15,8 @@ typedef struct input_udp {
     char interface_address[64];
 } input_udp_t;
 
+int input_udp_parse_url(const char *url, char *host, size_t host_size, uint16_t *port);
+bool input_udp_is_multicast_host(const char *host);
 int input_udp_open(input_udp_t *input, const char *url);
 int input_udp_open_with_interface(input_udp_t *input, const char *url, const char *interface_address);
 ssize_t input_udp_receive(input_udp_t *input, uint8_t *buffer, size_t buffer_size);

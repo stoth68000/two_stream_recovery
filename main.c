@@ -1,3 +1,4 @@
+#include "command_line.h"
 #include "input_udp.h"
 #include "output_udp.h"
 #include "recovery_engine.h"
@@ -13,18 +14,8 @@
 #include <unistd.h>
 
 #define INPUT_BUFFER_SIZE (TS_PACKET_SIZE * 64)
-#define DEFAULT_OUTPUT_URL "udp://127.0.0.1:4500"
 
 static volatile sig_atomic_t should_stop = 0;
-
-typedef struct command_line_options {
-    const char *input_primary_url;
-    const char *input_secondary_url;
-    const char *input_primary_interface;
-    const char *input_secondary_interface;
-    const char *output_url;
-    recovery_engine_config_t recovery_config;
-} command_line_options_t;
 
 static void handle_signal(int signum)
 {
@@ -130,142 +121,6 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
     return 0;
 }
 
-static void print_usage(const char *program_name)
-{
-    recovery_engine_config_t defaults = recovery_engine_default_config();
-
-    fprintf(stderr,
-            "Usage:\n"
-            "  %s --input-primary-url <url> --input-secondary-url <url> [options]\n"
-            "\n"
-            "Options:\n"
-            "  --input-primary-url <url>\n"
-            "      Required. UDP URL for stream #1, the preferred source of truth.\n"
-            "      Multicast group URLs automatically join the group with IGMP.\n"
-            "\n"
-            "  --input-secondary-url <url>\n"
-            "      Required. UDP URL for stream #2, the delayed recovery witness.\n"
-            "      Multicast group URLs automatically join the group with IGMP.\n"
-            "\n"
-            "  --input-primary-interface <ipv4>\n"
-            "      Local interface IPv4 address used when joining the primary multicast group.\n"
-            "      Default: 0.0.0.0\n"
-            "\n"
-            "  --input-secondary-interface <ipv4>\n"
-            "      Local interface IPv4 address used when joining the secondary multicast group.\n"
-            "      Default: 0.0.0.0\n"
-            "\n"
-            "  --output-url <url>\n"
-            "      UDP destination for recovered output. Default: %s\n"
-            "\n"
-            "  --primary-delay-ms <ms>\n"
-            "      Milliseconds to delay stream #1 before output, allowing stream #2 time to arrive.\n"
-            "      Default: %llu\n"
-            "\n"
-            "  --max-secondary-latency-ms <ms>\n"
-            "      Maximum trusted arrival latency from stream #1 to stream #2 for recovery matches.\n"
-            "      Default: %llu\n"
-            "\n"
-            "  --alignment-window-ms <ms>\n"
-            "      Arrival-time search window used when comparing packets for stream alignment.\n"
-            "      Default: %llu\n"
-            "\n"
-            "  -h, --help\n"
-            "      Show this help page.\n",
-            program_name,
-            DEFAULT_OUTPUT_URL,
-            (unsigned long long)(defaults.primary_delay_ns / 1000000ULL),
-            (unsigned long long)(defaults.max_secondary_latency_ns / 1000000ULL),
-            (unsigned long long)(defaults.alignment_window_ns / 1000000ULL));
-}
-
-static int parse_u64_ms_option(const char *name, const char *value, uint64_t *target_ns)
-{
-    unsigned long long parsed;
-    char *end = NULL;
-
-    errno = 0;
-    parsed = strtoull(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' ||
-        parsed > UINT64_MAX / 1000000ULL) {
-        fprintf(stderr, "invalid millisecond value for %s: %s\n", name, value);
-        return -1;
-    }
-
-    *target_ns = (uint64_t)parsed * 1000000ULL;
-    return 0;
-}
-
-static int parse_command_line(int argc, char **argv, command_line_options_t *options)
-{
-    int i;
-
-    memset(options, 0, sizeof(*options));
-    options->output_url = DEFAULT_OUTPUT_URL;
-    options->recovery_config = recovery_engine_default_config();
-
-    for (i = 1; i < argc; i++) {
-        const char *name = argv[i];
-        const char **target = NULL;
-        uint64_t *ms_target_ns = NULL;
-
-        if (strcmp(name, "--input-primary-url") == 0) {
-            target = &options->input_primary_url;
-        } else if (strcmp(name, "--input-secondary-url") == 0) {
-            target = &options->input_secondary_url;
-        } else if (strcmp(name, "--input-primary-interface") == 0) {
-            target = &options->input_primary_interface;
-        } else if (strcmp(name, "--input-secondary-interface") == 0) {
-            target = &options->input_secondary_interface;
-        } else if (strcmp(name, "--output-url") == 0) {
-            target = &options->output_url;
-        } else if (strcmp(name, "--primary-delay-ms") == 0) {
-            ms_target_ns = &options->recovery_config.primary_delay_ns;
-        } else if (strcmp(name, "--max-secondary-latency-ms") == 0) {
-            ms_target_ns = &options->recovery_config.max_secondary_latency_ns;
-        } else if (strcmp(name, "--alignment-window-ms") == 0) {
-            ms_target_ns = &options->recovery_config.alignment_window_ns;
-        } else if (strcmp(name, "--help") == 0 || strcmp(name, "-h") == 0) {
-            print_usage(argv[0]);
-            return 1;
-        } else {
-            fprintf(stderr, "unknown option: %s\n", name);
-            print_usage(argv[0]);
-            return -1;
-        }
-
-        if (i + 1 >= argc) {
-            fprintf(stderr, "missing value for option: %s\n", name);
-            print_usage(argv[0]);
-            return -1;
-        }
-
-        if (ms_target_ns != NULL) {
-            if (parse_u64_ms_option(name, argv[++i], ms_target_ns) != 0) {
-                print_usage(argv[0]);
-                return -1;
-            }
-            continue;
-        }
-
-        if (*target != NULL && target != &options->output_url) {
-            fprintf(stderr, "duplicate option: %s\n", name);
-            print_usage(argv[0]);
-            return -1;
-        }
-
-        *target = argv[++i];
-    }
-
-    if (options->input_primary_url == NULL || options->input_secondary_url == NULL) {
-        fprintf(stderr, "both input URLs are required\n");
-        print_usage(argv[0]);
-        return -1;
-    }
-
-    return 0;
-}
-
 int main(int argc, char **argv)
 {
     input_udp_t inputs[2];
@@ -274,7 +129,7 @@ int main(int argc, char **argv)
     int parse_result;
     int result = EXIT_FAILURE;
 
-    parse_result = parse_command_line(argc, argv, &options);
+    parse_result = command_line_parse(argc, argv, &options);
     if (parse_result > 0) {
         return EXIT_SUCCESS;
     }

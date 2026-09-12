@@ -1,3 +1,6 @@
+#include "../command_line.h"
+#include "../input_udp.h"
+#include "../output_udp.h"
 #include "../recovery_engine.h"
 #include "../report_stats.h"
 #include "../ts_packet.h"
@@ -121,6 +124,178 @@ static void init_engine(recovery_engine_t *engine, report_stats_t *stats, captur
     assert(recovery_engine_init(engine, sink, stats) == 0);
 }
 
+static void test_command_line_parse(void)
+{
+    command_line_options_t options;
+    char *valid[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://239.1.1.1:5000",
+        "--input-secondary-url", "udp://239.1.1.2:5001",
+        "--input-primary-interface", "192.168.1.10",
+        "--input-secondary-interface", "192.168.1.11",
+        "--output-url", "udp://127.0.0.1:4501",
+        "--primary-delay-ms", "3000",
+        "--max-secondary-latency-ms", "7000",
+        "--alignment-window-ms", "9000"
+    };
+    char *defaults[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://127.0.0.1:5000",
+        "--input-secondary-url", "udp://127.0.0.1:5001"
+    };
+    char *missing_secondary[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://127.0.0.1:5000"
+    };
+    char *unknown[] = {
+        "two_stream_recovery",
+        "--wat", "1",
+        "--input-primary-url", "udp://127.0.0.1:5000",
+        "--input-secondary-url", "udp://127.0.0.1:5001"
+    };
+    char *invalid_ms[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://127.0.0.1:5000",
+        "--input-secondary-url", "udp://127.0.0.1:5001",
+        "--primary-delay-ms", "12x"
+    };
+    char *duplicate_primary[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://127.0.0.1:5000",
+        "--input-primary-url", "udp://127.0.0.1:5002",
+        "--input-secondary-url", "udp://127.0.0.1:5001"
+    };
+    char *help[] = {"two_stream_recovery", "--help"};
+
+    assert(command_line_parse((int)(sizeof(valid) / sizeof(valid[0])), valid, &options) == 0);
+    assert(strcmp(options.input_primary_url, "udp://239.1.1.1:5000") == 0);
+    assert(strcmp(options.input_secondary_url, "udp://239.1.1.2:5001") == 0);
+    assert(strcmp(options.input_primary_interface, "192.168.1.10") == 0);
+    assert(strcmp(options.input_secondary_interface, "192.168.1.11") == 0);
+    assert(strcmp(options.output_url, "udp://127.0.0.1:4501") == 0);
+    assert(options.recovery_config.primary_delay_ns == 3000000000ULL);
+    assert(options.recovery_config.max_secondary_latency_ns == 7000000000ULL);
+    assert(options.recovery_config.alignment_window_ns == 9000000000ULL);
+
+    assert(command_line_parse((int)(sizeof(defaults) / sizeof(defaults[0])), defaults, &options) == 0);
+    assert(strcmp(options.output_url, DEFAULT_OUTPUT_URL) == 0);
+    assert(options.recovery_config.primary_delay_ns == RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS);
+    assert(options.recovery_config.max_secondary_latency_ns ==
+           RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS);
+    assert(options.recovery_config.alignment_window_ns == RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS);
+
+    assert(command_line_parse_silent((int)(sizeof(missing_secondary) / sizeof(missing_secondary[0])),
+                                     missing_secondary, &options) < 0);
+    assert(command_line_parse_silent((int)(sizeof(unknown) / sizeof(unknown[0])), unknown, &options) < 0);
+    assert(command_line_parse_silent((int)(sizeof(invalid_ms) / sizeof(invalid_ms[0])), invalid_ms, &options) < 0);
+    assert(command_line_parse_silent((int)(sizeof(duplicate_primary) / sizeof(duplicate_primary[0])),
+                                     duplicate_primary, &options) < 0);
+    assert(command_line_parse_silent((int)(sizeof(help) / sizeof(help[0])), help, &options) > 0);
+}
+
+static void test_udp_url_parsing(void)
+{
+    char host[128];
+    uint16_t port;
+
+    assert(input_udp_parse_url("udp://239.1.2.3:5000", host, sizeof(host), &port) == 0);
+    assert(strcmp(host, "239.1.2.3") == 0);
+    assert(port == 5000);
+    assert(input_udp_is_multicast_host(host));
+
+    assert(input_udp_parse_url("127.0.0.1:6000", host, sizeof(host), &port) == 0);
+    assert(strcmp(host, "127.0.0.1") == 0);
+    assert(port == 6000);
+    assert(!input_udp_is_multicast_host(host));
+
+    assert(input_udp_parse_url("udp://*:7000", host, sizeof(host), &port) == 0);
+    assert(strcmp(host, "*") == 0);
+    assert(port == 7000);
+
+    assert(output_udp_parse_url("udp://127.0.0.1:4500", host, sizeof(host), &port) == 0);
+    assert(strcmp(host, "127.0.0.1") == 0);
+    assert(port == 4500);
+
+    assert(input_udp_is_multicast_host("224.0.0.0"));
+    assert(input_udp_is_multicast_host("239.255.255.255"));
+    assert(!input_udp_is_multicast_host("223.255.255.255"));
+    assert(!input_udp_is_multicast_host("240.0.0.0"));
+    assert(!input_udp_is_multicast_host("not-an-ip"));
+
+    assert(input_udp_parse_url("udp://127.0.0.1", host, sizeof(host), &port) != 0);
+    assert(input_udp_parse_url("udp://127.0.0.1:65536", host, sizeof(host), &port) != 0);
+    assert(input_udp_parse_url("udp://127.0.0.1:abc", host, sizeof(host), &port) != 0);
+    assert(output_udp_parse_url("udp://:4500", host, sizeof(host), &port) != 0);
+    assert(output_udp_parse_url("udp://127.0.0.1:", host, sizeof(host), &port) != 0);
+    assert(output_udp_parse_url("udp://127.0.0.1:4500", host, 4, &port) != 0);
+}
+
+static void test_output_udp_pending_batch(void)
+{
+    output_udp_t output;
+    uint8_t packet[TS_PACKET_SIZE];
+    size_t i;
+
+    memset(&output, 0, sizeof(output));
+    output.fd = -1;
+    make_packet(packet, 0x100, 1, 0x66);
+
+    for (i = 0; i < OUTPUT_TS_PACKETS_PER_DATAGRAM - 1; i++) {
+        assert(output_udp_send_ts_packet(&output, packet) == 0);
+        assert(output.pending_packets == i + 1);
+    }
+
+    output_udp_close(&output);
+    assert(output.fd == -1);
+}
+
+static void test_packet_sink_helpers(void)
+{
+    capture_sink_t capture;
+    packet_sink_t sink;
+    packet_sink_t no_flush_sink;
+    uint8_t packet[TS_PACKET_SIZE];
+
+    memset(&capture, 0, sizeof(capture));
+    sink = capture_as_packet_sink(&capture);
+    make_packet(packet, 0x100, 1, 0x20);
+    assert(packet_sink_send_ts_packet(&sink, packet) == 0);
+    assert(packet_sink_flush(&sink) == 0);
+    assert(capture.packet_count == 1);
+    assert(capture.flush_count == 1);
+    assert(memcmp(capture.packets[0], packet, TS_PACKET_SIZE) == 0);
+
+    no_flush_sink = sink;
+    no_flush_sink.flush = NULL;
+    assert(packet_sink_flush(&no_flush_sink) == 0);
+}
+
+static void test_recovery_engine_config(void)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    recovery_engine_config_t config = recovery_engine_default_config();
+
+    assert(config.primary_delay_ns == RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS);
+    assert(config.max_secondary_latency_ns == RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS);
+    assert(config.alignment_window_ns == RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS);
+
+    config.primary_delay_ns = 123000000ULL;
+    config.max_secondary_latency_ns = 456000000ULL;
+    config.alignment_window_ns = 789000000ULL;
+
+    memset(&capture, 0, sizeof(capture));
+    report_stats_init(&stats);
+    sink = capture_as_packet_sink(&capture);
+    assert(recovery_engine_init_with_config(&engine, &sink, &stats, &config) == 0);
+    assert(engine.config.primary_delay_ns == 123000000ULL);
+    assert(engine.config.max_secondary_latency_ns == 456000000ULL);
+    assert(engine.config.alignment_window_ns == 789000000ULL);
+    recovery_engine_free(&engine);
+}
+
 static void test_ts_packet_parse(void)
 {
     uint8_t packet[TS_PACKET_SIZE];
@@ -142,6 +317,72 @@ static void test_ts_packet_parse(void)
 
     packet[0] = 0x00;
     assert(!ts_packet_parse(packet, &info));
+}
+
+static void test_ts_packet_parse_edges(void)
+{
+    uint8_t packet[TS_PACKET_SIZE];
+    ts_packet_info_t info;
+
+    make_packet(packet, 0x120, 4, 0x55);
+    packet[3] = 0x00;
+    assert(!ts_packet_parse(packet, &info));
+
+    make_packet(packet, 0x120, 4, 0x55);
+    packet[3] = 0x20 | 4;
+    packet[4] = 184;
+    assert(!ts_packet_parse(packet, &info));
+
+    make_packet(packet, 0x120, 4, 0x55);
+    mark_transport_error(packet);
+    assert(ts_packet_parse(packet, &info));
+    assert(info.transport_error);
+
+    make_packet(packet, 0x120, 4, 0x55);
+    mark_discontinuity(packet);
+    assert(ts_packet_parse(packet, &info));
+    assert(info.discontinuity_indicator);
+    assert(info.has_adaptation);
+    assert(info.has_payload);
+}
+
+static void test_report_stats_observe_edges(void)
+{
+    report_stats_t stats;
+    uint8_t packet[TS_PACKET_SIZE];
+    ts_packet_info_t info;
+
+    report_stats_init(&stats);
+
+    make_packet(packet, 0x120, 0, 0x40);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 0, &info);
+
+    make_packet(packet, 0x120, 0, 0x41);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 0, &info);
+    assert(stats.duplicate_counters[0] == 1);
+    assert(stats.continuity_errors[0] == 0);
+
+    make_packet(packet, 0x120, 3, 0x42);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 0, &info);
+    assert(stats.continuity_errors[0] == 1);
+
+    make_null_packet(packet, 0x43);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 1, &info);
+    assert(stats.null_packets[1] == 1);
+
+    make_pcr_packet(packet, 0x100, 1, 0x1234);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 1, &info);
+    assert(stats.pcr_packets[1] == 1);
+
+    mark_transport_error(packet);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 1, &info);
+    assert(stats.transport_errors[1] == 1);
 }
 
 static void test_primary_pass_through(void)
@@ -753,7 +994,14 @@ static void test_real_file_content_recovery_run(void)
 
 int main(void)
 {
+    test_command_line_parse();
+    test_udp_url_parsing();
+    test_output_udp_pending_batch();
+    test_packet_sink_helpers();
+    test_recovery_engine_config();
     test_ts_packet_parse();
+    test_ts_packet_parse_edges();
+    test_report_stats_observe_edges();
     test_primary_pass_through();
     test_single_packet_recovery();
     test_burst_recovery();
