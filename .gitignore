@@ -1,0 +1,3 @@
+*.o
+two_stream_recovery
+.*.swp
