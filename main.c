@@ -30,13 +30,14 @@ static int process_datagram(recovery_engine_t *engine, report_stats_t *stats, in
 
     for (offset = 0; offset + TS_PACKET_SIZE <= bytes; offset += TS_PACKET_SIZE) {
         const uint8_t *packet = buffer + offset;
+        ts_packet_info_t info;
 
-        if (!ts_packet_has_sync(packet)) {
+        if (!ts_packet_parse(packet, &info)) {
             stats->sync_errors[stream_id]++;
             continue;
         }
 
-        stats->packets_received[stream_id]++;
+        report_stats_observe_packet(stats, stream_id, &info);
         if (recovery_engine_push_packet(engine, stream_id, packet) != 0) {
             return -1;
         }
