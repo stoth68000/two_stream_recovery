@@ -114,6 +114,26 @@ int output_udp_send_ts_packet(output_udp_t *output, const uint8_t packet[188])
     return 0;
 }
 
+static int output_udp_sink_send_ts_packet(void *ctx, const uint8_t packet[TS_PACKET_SIZE])
+{
+    return output_udp_send_ts_packet((output_udp_t *)ctx, packet);
+}
+
+static int output_udp_sink_flush(void *ctx)
+{
+    return output_udp_flush((output_udp_t *)ctx);
+}
+
+packet_sink_t output_udp_as_packet_sink(output_udp_t *output)
+{
+    packet_sink_t sink;
+
+    sink.ctx = output;
+    sink.send_ts_packet = output_udp_sink_send_ts_packet;
+    sink.flush = output_udp_sink_flush;
+    return sink;
+}
+
 void output_udp_close(output_udp_t *output)
 {
     if (output->fd >= 0) {

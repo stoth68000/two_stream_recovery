@@ -144,7 +144,7 @@ static void observe_output_record(recovery_engine_t *engine, const packet_record
 
 static int output_record(recovery_engine_t *engine, const packet_record_t *record)
 {
-    if (output_udp_send_ts_packet(engine->output, record->packet) != 0) {
+    if (packet_sink_send_ts_packet(engine->sink, record->packet) != 0) {
         return -1;
     }
 
@@ -583,10 +583,10 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
     engine->stats->alignment_confidence = engine->alignment.confidence;
 }
 
-int recovery_engine_init(recovery_engine_t *engine, output_udp_t *output, report_stats_t *stats)
+int recovery_engine_init(recovery_engine_t *engine, packet_sink_t *sink, report_stats_t *stats)
 {
     memset(engine, 0, sizeof(*engine));
-    engine->output = output;
+    engine->sink = sink;
     engine->stats = stats;
 
     if (packet_history_init(&engine->history[0], RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS) != 0) {
@@ -689,7 +689,7 @@ int recovery_engine_flush(recovery_engine_t *engine)
     if (recovery_engine_drain(engine, true) != 0) {
         return -1;
     }
-    return output_udp_flush(engine->output);
+    return packet_sink_flush(engine->sink);
 }
 
 void recovery_engine_free(recovery_engine_t *engine)

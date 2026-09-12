@@ -55,9 +55,11 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
     uint8_t buffer[INPUT_BUFFER_SIZE];
     report_stats_t stats;
     recovery_engine_t engine;
+    packet_sink_t sink;
 
     report_stats_init(&stats);
-    if (recovery_engine_init(&engine, output, &stats) != 0) {
+    sink = output_udp_as_packet_sink(output);
+    if (recovery_engine_init(&engine, &sink, &stats) != 0) {
         fprintf(stderr, "failed to initialize recovery engine\n");
         return -1;
     }

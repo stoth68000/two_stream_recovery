@@ -1,3 +1,4 @@
 *.o
 two_stream_recovery
+tests/test_recovery
 .*.swp

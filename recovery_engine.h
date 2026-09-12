@@ -1,7 +1,7 @@
 #ifndef RECOVERY_ENGINE_H
 #define RECOVERY_ENGINE_H
 
-#include "output_udp.h"
+#include "packet_sink.h"
 #include "report_stats.h"
 #include "ts_packet.h"
 
@@ -84,7 +84,7 @@ typedef struct pcr_timing_model {
 } pcr_timing_model_t;
 
 typedef struct recovery_engine {
-    output_udp_t *output;
+    packet_sink_t *sink;
     report_stats_t *stats;
     packet_history_t history[2];
     primary_delay_queue_t primary_queue;
@@ -95,7 +95,7 @@ typedef struct recovery_engine {
     output_pid_state_t output_pid_state[REPORT_STATS_PIDS];
 } recovery_engine_t;
 
-int recovery_engine_init(recovery_engine_t *engine, output_udp_t *output, report_stats_t *stats);
+int recovery_engine_init(recovery_engine_t *engine, packet_sink_t *sink, report_stats_t *stats);
 int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const uint8_t packet[TS_PACKET_SIZE],
                                 const ts_packet_info_t *info);
 int recovery_engine_drain(recovery_engine_t *engine, bool force);
