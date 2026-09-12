@@ -105,6 +105,10 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output)
             }
         }
 
+        if (recovery_engine_drain(&engine, false) != 0) {
+            recovery_engine_free(&engine);
+            return -1;
+        }
         report_stats_maybe_print(&stats, false);
     }
 

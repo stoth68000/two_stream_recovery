@@ -18,6 +18,7 @@ typedef struct report_stats {
     uint64_t null_packets[REPORT_STATS_STREAMS];
     uint64_t pcr_packets[REPORT_STATS_STREAMS];
     uint64_t stream_disagreements;
+    uint64_t primary_delay_overflows;
     int64_t alignment_offset_packets;
     uint32_t alignment_confidence;
     uint64_t per_pid_packets[REPORT_STATS_STREAMS][REPORT_STATS_PIDS];
