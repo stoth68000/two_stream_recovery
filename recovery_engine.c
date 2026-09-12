@@ -134,6 +134,56 @@ static bool record_is_informative(const packet_record_t *record)
     return !record->is_null && !record->transport_error;
 }
 
+static void observe_output_record(recovery_engine_t *engine, const packet_record_t *record)
+{
+    if (!record->is_null && !record->transport_error && !record->discontinuity_indicator) {
+        engine->output_pid_state[record->pid].valid = true;
+        engine->output_pid_state[record->pid].continuity_counter = record->continuity_counter;
+    }
+}
+
+static int output_record(recovery_engine_t *engine, const packet_record_t *record)
+{
+    if (output_udp_send_ts_packet(engine->output, record->packet) != 0) {
+        return -1;
+    }
+
+    engine->stats->output_packets++;
+    observe_output_record(engine, record);
+    return 0;
+}
+
+static bool continuity_gap_for_record(recovery_engine_t *engine, const packet_record_t *record,
+                                      uint8_t *expected_counter, uint8_t *missing_count)
+{
+    output_pid_state_t *state;
+    uint8_t expected;
+    uint8_t gap;
+
+    if (record->is_null || record->transport_error || record->discontinuity_indicator || !record->has_payload) {
+        return false;
+    }
+
+    state = &engine->output_pid_state[record->pid];
+    if (!state->valid) {
+        return false;
+    }
+
+    expected = (uint8_t)((state->continuity_counter + 1U) & 0x0fU);
+    if (record->continuity_counter == expected || record->continuity_counter == state->continuity_counter) {
+        return false;
+    }
+
+    gap = (uint8_t)((record->continuity_counter + 16U - expected) & 0x0fU);
+    if (gap == 0) {
+        return false;
+    }
+
+    *expected_counter = expected;
+    *missing_count = gap;
+    return true;
+}
+
 static uint64_t packet_info_pcr_value(const ts_packet_info_t *info)
 {
     return (info->pcr_base * 300ULL) + info->pcr_extension;
@@ -363,14 +413,45 @@ static int recover_nulls_before_primary(recovery_engine_t *engine, const packet_
     for (output_index = secondary_match->stream_index - missing_nulls; output_index < secondary_match->stream_index;
          output_index++) {
         packet_record_t *null_record = packet_history_find_index(&engine->history[1], output_index);
-        if (null_record == NULL || output_udp_send_ts_packet(engine->output, null_record->packet) != 0) {
+        if (null_record == NULL || output_record(engine, null_record) != 0) {
             return -1;
         }
         engine->stats->recovered_packets++;
         engine->stats->recovered_null_packets++;
-        engine->stats->output_packets++;
     }
 
+    return 0;
+}
+
+static int recover_single_content_before_primary(recovery_engine_t *engine, const packet_record_t *primary,
+                                                 const packet_record_t *secondary_match)
+{
+    uint8_t expected_counter;
+    uint8_t missing_count;
+    uint64_t index;
+
+    if (!engine->last_primary_anchor.valid || secondary_match == NULL || engine->alignment.confidence < 40 ||
+        !continuity_gap_for_record(engine, primary, &expected_counter, &missing_count) || missing_count != 1 ||
+        secondary_match->stream_index <= engine->last_primary_anchor.secondary_index) {
+        return 0;
+    }
+
+    for (index = engine->last_primary_anchor.secondary_index + 1ULL; index < secondary_match->stream_index; index++) {
+        packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
+
+        if (candidate != NULL && !candidate->is_null && !candidate->transport_error &&
+            !candidate->discontinuity_indicator && candidate->pid == primary->pid &&
+            candidate->continuity_counter == expected_counter && candidate->has_payload) {
+            if (output_record(engine, candidate) != 0) {
+                return -1;
+            }
+            engine->stats->recovered_packets++;
+            engine->stats->recovered_content_packets++;
+            return 0;
+        }
+    }
+
+    engine->stats->unrecoverable_loss++;
     return 0;
 }
 
@@ -485,6 +566,7 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
     record->has_pcr = info->has_pcr;
     record->is_null = info->is_null;
     record->transport_error = info->transport_error;
+    record->discontinuity_indicator = info->discontinuity_indicator;
     record->pcr_value = info->has_pcr ? packet_info_pcr_value(info) : 0;
     record->hash = hash_packet(packet);
     memcpy(record->packet, packet, TS_PACKET_SIZE);
@@ -494,10 +576,9 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
 
     if (stream_id == 0 && primary_delay_queue_push(&engine->primary_queue, record) != 0) {
         packet_record_t *oldest = primary_delay_queue_front(&engine->primary_queue);
-        if (oldest == NULL || output_udp_send_ts_packet(engine->output, oldest->packet) != 0) {
+        if (oldest == NULL || output_record(engine, oldest) != 0) {
             return -1;
         }
-        engine->stats->output_packets++;
         engine->stats->primary_delay_overflows++;
         primary_delay_queue_pop(&engine->primary_queue);
         if (primary_delay_queue_push(&engine->primary_queue, record) != 0) {
@@ -525,10 +606,13 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             return -1;
         }
 
-        if (output_udp_send_ts_packet(engine->output, record->packet) != 0) {
+        if (recover_single_content_before_primary(engine, record, secondary_match) != 0) {
             return -1;
         }
-        engine->stats->output_packets++;
+
+        if (output_record(engine, record) != 0) {
+            return -1;
+        }
         if (secondary_match != NULL) {
             engine->last_primary_anchor.valid = true;
             engine->last_primary_anchor.primary_index = record->stream_index;

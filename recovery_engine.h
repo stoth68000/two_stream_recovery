@@ -29,6 +29,11 @@ typedef struct primary_anchor {
     uint64_t secondary_index;
 } primary_anchor_t;
 
+typedef struct output_pid_state {
+    bool valid;
+    uint8_t continuity_counter;
+} output_pid_state_t;
+
 typedef struct packet_record {
     uint64_t stream_index;
     uint64_t arrival_time_ns;
@@ -38,6 +43,7 @@ typedef struct packet_record {
     bool has_pcr;
     bool is_null;
     bool transport_error;
+    bool discontinuity_indicator;
     uint64_t pcr_value;
     uint64_t hash;
     uint8_t packet[TS_PACKET_SIZE];
@@ -85,6 +91,7 @@ typedef struct recovery_engine {
     uint64_t next_stream_index[2];
     alignment_state_t alignment;
     primary_anchor_t last_primary_anchor;
+    output_pid_state_t output_pid_state[REPORT_STATS_PIDS];
 } recovery_engine_t;
 
 int recovery_engine_init(recovery_engine_t *engine, output_udp_t *output, report_stats_t *stats);

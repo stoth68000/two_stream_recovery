@@ -20,6 +20,7 @@ typedef struct report_stats {
     uint64_t stream_disagreements;
     uint64_t primary_delay_overflows;
     uint64_t recovered_null_packets;
+    uint64_t recovered_content_packets;
     uint64_t unrecoverable_null_regions;
     uint32_t pcr_timing_confidence[REPORT_STATS_STREAMS];
     double pcr_bitrate_bps[REPORT_STATS_STREAMS];
