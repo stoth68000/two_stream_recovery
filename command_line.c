@@ -39,6 +39,10 @@ void command_line_print_usage(const char *program_name)
             "      Enable the REST stats API and web UI on 127.0.0.1:<number>.\n"
             "      Default: disabled\n"
             "\n"
+            "  --console-report\n"
+            "      Print per-second statistics to the console.\n"
+            "      Default: disabled\n"
+            "\n"
             "  --primary-delay-ms <ms>\n"
             "      Milliseconds to delay stream #1 before output, allowing stream #2 time to arrive.\n"
             "      Default: %llu\n"
@@ -169,6 +173,16 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
             u32_target = &u32_max;
             u32_max = 65535U;
             is_http_port = true;
+        } else if (strcmp(name, "--console-report") == 0) {
+            if (options->console_report) {
+                if (print_errors) {
+                    fprintf(stderr, "duplicate option: %s\n", name);
+                    command_line_print_usage(argv[0]);
+                }
+                return -1;
+            }
+            options->console_report = true;
+            continue;
         } else if (strcmp(name, "--primary-delay-ms") == 0) {
             ms_target_ns = &options->recovery_config.primary_delay_ns;
         } else if (strcmp(name, "--max-secondary-latency-ms") == 0) {

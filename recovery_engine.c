@@ -165,6 +165,9 @@ static void observe_output_record(recovery_engine_t *engine, const packet_record
     state->valid = true;
     state->continuity_counter = record->continuity_counter;
     state->last_arrival_time_ns = record->arrival_time_ns;
+    if (record->source_stream_id == 0) {
+        state->last_primary_continuity_errors = record->stream_continuity_errors;
+    }
 }
 
 static int output_record(recovery_engine_t *engine, const packet_record_t *record)
@@ -824,6 +827,7 @@ static int recover_pid_gap_before_primary(recovery_engine_t *engine,
     output_pid_state_t *state;
     uint64_t primary_gap_ns;
     int64_t offset_ns;
+    int64_t offset_magnitude_ns;
     int recovered;
 
     if (primary->is_null || primary->transport_error ||
@@ -835,6 +839,9 @@ static int recover_pid_gap_before_primary(recovery_engine_t *engine,
     if (!state->valid || primary->arrival_time_ns <= state->last_arrival_time_ns) {
         return 0;
     }
+    if (primary->stream_continuity_errors <= state->last_primary_continuity_errors) {
+        return 0;
+    }
 
     primary_gap_ns = primary->arrival_time_ns - state->last_arrival_time_ns;
     if (primary_gap_ns < RECOVERY_ENGINE_PID_GAP_MIN_NS) {
@@ -842,15 +849,16 @@ static int recover_pid_gap_before_primary(recovery_engine_t *engine,
     }
 
     offset_ns = estimated_secondary_time_offset_ns(engine);
+    offset_magnitude_ns = offset_ns < 0 ? -offset_ns : offset_ns;
     recovered = recover_pid_time_range(engine, state, primary,
-                                       apply_time_offset(state->last_arrival_time_ns, offset_ns),
-                                       apply_time_offset(primary->arrival_time_ns, offset_ns));
-    if (recovered == 0 && offset_ns != 0) {
+                                       apply_time_offset(state->last_arrival_time_ns, offset_magnitude_ns),
+                                       apply_time_offset(primary->arrival_time_ns, offset_magnitude_ns));
+    if (recovered == 0 && offset_magnitude_ns != 0) {
         recovered = recover_pid_time_range(engine, state, primary,
-                                           apply_time_offset(state->last_arrival_time_ns, -offset_ns),
-                                           apply_time_offset(primary->arrival_time_ns, -offset_ns));
+                                           apply_time_offset(state->last_arrival_time_ns, -offset_magnitude_ns),
+                                           apply_time_offset(primary->arrival_time_ns, -offset_magnitude_ns));
     }
-    if (recovered == 0 && offset_ns != 0) {
+    if (recovered == 0 && offset_magnitude_ns != 0) {
         recovered = recover_pid_time_range(engine, state, primary,
                                            state->last_arrival_time_ns,
                                            primary->arrival_time_ns);
@@ -1236,6 +1244,7 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
     }
 
     record = packet_history_push(&engine->history[stream_id]);
+    record->source_stream_id = stream_id;
     record->stream_index = engine->next_stream_index[stream_id]++;
     record->arrival_time_ns = report_stats_now_ns();
     record->pid = info->pid;

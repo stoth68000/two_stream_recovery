@@ -140,7 +140,8 @@ static void test_command_line_parse(void)
         "--history-ms", "12000",
         "--max-content-burst-packets", "25",
         "--min-alignment-confidence", "55",
-        "--http-port", "9601"
+        "--http-port", "9601",
+        "--console-report"
     };
     char *defaults[] = {
         "two_stream_recovery",
@@ -188,6 +189,13 @@ static void test_command_line_parse(void)
         "--http-port", "9601",
         "--http-port", "9602"
     };
+    char *duplicate_console_report[] = {
+        "two_stream_recovery",
+        "--input-primary-url", "udp://127.0.0.1:5000",
+        "--input-secondary-url", "udp://127.0.0.1:5001",
+        "--console-report",
+        "--console-report"
+    };
     char *duplicate_primary[] = {
         "two_stream_recovery",
         "--input-primary-url", "udp://127.0.0.1:5000",
@@ -209,10 +217,12 @@ static void test_command_line_parse(void)
     assert(options.recovery_config.max_content_burst_packets == 25U);
     assert(options.recovery_config.min_alignment_confidence == 55U);
     assert(options.http_port == 9601U);
+    assert(options.console_report);
 
     assert(command_line_parse((int)(sizeof(defaults) / sizeof(defaults[0])), defaults, &options) == 0);
     assert(strcmp(options.output_url, DEFAULT_OUTPUT_URL) == 0);
     assert(options.http_port == 0);
+    assert(!options.console_report);
     assert(options.recovery_config.primary_delay_ns == RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS);
     assert(options.recovery_config.max_secondary_latency_ns ==
            RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS);
@@ -235,6 +245,8 @@ static void test_command_line_parse(void)
                                      invalid_http_port, &options) < 0);
     assert(command_line_parse_silent((int)(sizeof(duplicate_http_port) / sizeof(duplicate_http_port[0])),
                                      duplicate_http_port, &options) < 0);
+    assert(command_line_parse_silent((int)(sizeof(duplicate_console_report) / sizeof(duplicate_console_report[0])),
+                                     duplicate_console_report, &options) < 0);
     assert(command_line_parse_silent((int)(sizeof(duplicate_primary) / sizeof(duplicate_primary[0])),
                                      duplicate_primary, &options) < 0);
     assert(command_line_parse_silent((int)(sizeof(help) / sizeof(help[0])), help, &options) > 0);
@@ -760,7 +772,7 @@ static void test_pid_time_range_recovery_wrap_gap(void)
 {
     enum {
         PID = 49,
-        GAP_PACKETS = 32
+        GAP_PACKETS = 40
     };
     const uint64_t base_ns = 4000000000ULL;
     recovery_engine_t engine;
@@ -774,6 +786,9 @@ static void test_pid_time_range_recovery_wrap_gap(void)
 
     init_engine(&engine, &stats, &capture, &sink);
     engine.config.min_alignment_confidence = 0;
+    stats.pcr_timing_confidence[0] = 100;
+    stats.pcr_timing_confidence[1] = 100;
+    stats.pcr_delay_ns = -1900000000.0;
 
     make_packet(primary_a, PID, 0, 0x10);
     push_packet(&engine, &stats, 0, primary_a);
@@ -792,7 +807,7 @@ static void test_pid_time_range_recovery_wrap_gap(void)
             base_ns + 1900000000ULL + ((uint64_t)(i + 1U) * 100000000ULL);
     }
 
-    make_packet(primary_after, PID, 1, 0x70);
+    make_packet(primary_after, PID, (uint8_t)((GAP_PACKETS + 1U) & 0x0fU), 0x70);
     push_packet(&engine, &stats, 0, primary_after);
     assert(engine.primary_queue.count == 1);
     engine.primary_queue.records[engine.primary_queue.start].arrival_time_ns =

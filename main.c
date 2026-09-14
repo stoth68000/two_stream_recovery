@@ -93,7 +93,8 @@ static int process_datagram(recovery_engine_t *engine, report_stats_t *stats, in
 }
 
 static int run_loop(input_udp_t inputs[2], output_udp_t *output,
-                    const recovery_engine_config_t *recovery_config, uint16_t http_port)
+                    const recovery_engine_config_t *recovery_config, uint16_t http_port,
+                    bool console_report)
 {
     uint8_t buffer[INPUT_BUFFER_SIZE];
     report_stats_t stats;
@@ -184,11 +185,15 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
             web_server_close(&web_server);
             return -1;
         }
-        report_stats_maybe_print(&stats, false);
+        if (console_report) {
+            report_stats_maybe_print(&stats, false);
+        }
     }
 
     recovery_engine_flush(&engine);
-    report_stats_maybe_print(&stats, true);
+    if (console_report) {
+        report_stats_maybe_print(&stats, true);
+    }
     recovery_engine_free(&engine);
     web_server_close(&web_server);
     return 0;
@@ -228,7 +233,8 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    result = run_loop(inputs, &output, &options.recovery_config, options.http_port) == 0
+    result = run_loop(inputs, &output, &options.recovery_config, options.http_port,
+                      options.console_report) == 0
                  ? EXIT_SUCCESS
                  : EXIT_FAILURE;
 

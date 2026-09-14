@@ -62,9 +62,11 @@ typedef struct output_pid_state {
     uint8_t continuity_counter;
     uint64_t last_arrival_time_ns;
     uint64_t last_recovered_secondary_arrival_ns;
+    uint64_t last_primary_continuity_errors;
 } output_pid_state_t;
 
 typedef struct packet_record {
+    int source_stream_id;
     uint64_t stream_index;
     uint64_t arrival_time_ns;
     uint16_t pid;

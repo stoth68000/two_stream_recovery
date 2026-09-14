@@ -39,6 +39,6 @@ live-test: $(BIN)
 		--input-primary-url udp://127.0.0.1:4501 \
 		--input-secondary-url udp://127.0.0.1:4502 \
 		--output-url udp://127.0.0.1:4503 \
-		--alignment-window-ms 1000 \
+		--alignment-window-ms 3000 \
 		--min-alignment-confidence 0 \
 		--http-port 4500
