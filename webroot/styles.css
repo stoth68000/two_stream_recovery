@@ -248,15 +248,18 @@ td {
 
 dl {
   display: grid;
-  grid-template-columns: minmax(130px, 1fr) auto;
+  grid-template-columns: minmax(130px, 1fr) 10ch;
   gap: 10px 16px;
   margin: 14px 0 0;
 }
 
 dd {
+  min-width: 0;
   margin: 0;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .has-help {

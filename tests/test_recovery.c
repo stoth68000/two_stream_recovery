@@ -417,10 +417,13 @@ static void test_ts_packet_parse_edges(void)
 static void test_report_stats_observe_edges(void)
 {
     report_stats_t stats;
+    char json[8192];
     uint8_t packet[TS_PACKET_SIZE];
     ts_packet_info_t info;
 
     report_stats_init(&stats);
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"last_recovery_event\":\"Never\"") != NULL);
 
     make_packet(packet, 0x120, 0, 0x40);
     assert(ts_packet_parse(packet, &info));
@@ -459,6 +462,19 @@ static void test_report_stats_observe_edges(void)
     assert(stats.observed_secondary_latency_min_ns == 2000000000.0);
     assert(stats.observed_secondary_latency_avg_ns == 2000000000.0);
     assert(stats.observed_secondary_latency_max_ns == 2000000000.0);
+
+    report_stats_observe_recovery(&stats, false);
+    assert(stats.recovered_packets == 1);
+    assert(stats.recovered_content_packets == 1);
+    assert(stats.recovered_null_packets == 0);
+    assert(stats.last_recovery_event_time != 0);
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"last_recovery_event\":\"Never\"") == NULL);
+
+    report_stats_observe_recovery(&stats, true);
+    assert(stats.recovered_packets == 2);
+    assert(stats.recovered_content_packets == 1);
+    assert(stats.recovered_null_packets == 1);
 }
 
 static void test_primary_pass_through(void)

@@ -562,8 +562,7 @@ static int recover_nulls_before_primary(recovery_engine_t *engine, const packet_
         if (null_record == NULL || output_record(engine, null_record) != 0) {
             return -1;
         }
-        engine->stats->recovered_packets++;
-        engine->stats->recovered_null_packets++;
+        report_stats_observe_recovery(engine->stats, true);
     }
 
     return 0;
@@ -674,11 +673,8 @@ static int recover_secondary_time_range(recovery_engine_t *engine,
         if (output_record(engine, candidate) != 0) {
             return -1;
         }
-        engine->stats->recovered_packets++;
-        if (candidate->is_null) {
-            engine->stats->recovered_null_packets++;
-        } else {
-            engine->stats->recovered_content_packets++;
+        report_stats_observe_recovery(engine->stats, candidate->is_null);
+        if (!candidate->is_null) {
             recovered_content++;
         }
         engine->primary_gap.last_recovered_secondary_arrival_ns = candidate->arrival_time_ns;
@@ -809,8 +805,7 @@ static int recover_pid_time_range(recovery_engine_t *engine,
         if (output_record(engine, candidate) != 0) {
             return -1;
         }
-        engine->stats->recovered_packets++;
-        engine->stats->recovered_content_packets++;
+        report_stats_observe_recovery(engine->stats, false);
         state->last_recovered_secondary_arrival_ns = candidate->arrival_time_ns;
     }
 
@@ -951,8 +946,7 @@ static int recover_content_burst_before_primary(recovery_engine_t *engine, const
         if (output_record(engine, candidates[index]) != 0) {
             return -1;
         }
-        engine->stats->recovered_packets++;
-        engine->stats->recovered_content_packets++;
+        report_stats_observe_recovery(engine->stats, false);
     }
 
     if (found > 1) {
@@ -1041,8 +1035,7 @@ static int recover_content_burst_by_counter_before_primary(recovery_engine_t *en
         if (output_record(engine, candidates[i]) != 0) {
             return -1;
         }
-        engine->stats->recovered_packets++;
-        engine->stats->recovered_content_packets++;
+        report_stats_observe_recovery(engine->stats, false);
     }
 
     if (found > 1) {

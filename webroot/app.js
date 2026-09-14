@@ -1,6 +1,7 @@
 const numberFormat = new Intl.NumberFormat();
 
 const recoveryHelp = {
+  "Last Event": "The local date when the tool last repaired missing packets. Perfect during a clean run is Never. If you intentionally drop packets and recovery works, this should update immediately. Poor is an old or Never value while recovery counters should be rising.",
   "Content packets": "Recovered real video, audio, or table packets from the backup input. Higher means the tool repaired more primary-stream loss. Perfect is 0 during a clean run, but this should increase when you intentionally drop real stream packets. Poor is primary loss with this staying flat, or this climbing while Output becomes degraded.",
   "Null packets": "Recovered filler packets. These keep the transport stream shape steady but usually do not carry program content. Perfect is 0 during a clean run. Higher is expected when you drop null packets; poor only if Output becomes degraded or unrecoverable loss rises.",
   "Bursts": "Number of recovery events where several packets were repaired together. Perfect is 0 during a clean run. It should increment when you create a burst loss. High values mean the primary input is having repeated outages.",
@@ -25,6 +26,21 @@ function fmt(num) {
 
 function fmtMs(num) {
   return `${Number(num || 0).toFixed(3)} ms`;
+}
+
+function lastRecoveryEventRows(value) {
+  if (!value || value === "Never") {
+    return [
+      ["Last Event", "Never", recoveryHelp["Last Event"]],
+      ["", "-"]
+    ];
+  }
+
+  const parts = value.split(" ");
+  return [
+    ["Last Event", parts[0] || value, recoveryHelp["Last Event"]],
+    ["", parts[1] || "-"]
+  ];
 }
 
 function healthClass(health) {
@@ -95,6 +111,7 @@ function render(data) {
   document.getElementById("streams").innerHTML = streamRows.join("");
 
   renderDefinitionList("recovery", [
+    ...lastRecoveryEventRows(data.last_recovery_event),
     ["Content packets", fmt(data.recovered_content_packets), recoveryHelp["Content packets"]],
     ["Null packets", fmt(data.recovered_null_packets), recoveryHelp["Null packets"]],
     ["Bursts", fmt(data.recovered_content_bursts), recoveryHelp.Bursts],

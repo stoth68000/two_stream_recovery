@@ -146,6 +146,17 @@ void report_stats_observe_latency(report_stats_t *stats, uint64_t primary_arriva
     }
 }
 
+void report_stats_observe_recovery(report_stats_t *stats, bool is_null_packet)
+{
+    stats->recovered_packets++;
+    if (is_null_packet) {
+        stats->recovered_null_packets++;
+    } else {
+        stats->recovered_content_packets++;
+    }
+    stats->last_recovery_event_time = time(NULL);
+}
+
 void report_stats_reject_recovery(report_stats_t *stats, recovery_reject_reason_t reason)
 {
     if (reason >= 0 && reason < RECOVERY_REJECT_COUNT) {
@@ -175,6 +186,19 @@ static void report_stats_timestamp(char *timestamp, size_t timestamp_size)
     struct tm local_tm;
 
     wall_time = time(NULL);
+    localtime_r(&wall_time, &local_tm);
+    strftime(timestamp, timestamp_size, "%Y-%m-%d %H:%M:%S %z", &local_tm);
+}
+
+static void report_stats_wall_time(char *timestamp, size_t timestamp_size, time_t wall_time)
+{
+    struct tm local_tm;
+
+    if (wall_time == 0) {
+        snprintf(timestamp, timestamp_size, "Never");
+        return;
+    }
+
     localtime_r(&wall_time, &local_tm);
     strftime(timestamp, timestamp_size, "%Y-%m-%d %H:%M:%S %z", &local_tm);
 }
@@ -273,6 +297,7 @@ static void compute_rolling_window(const report_stats_t *stats,
 int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_size)
 {
     char timestamp[64];
+    char last_recovery_event[64];
     uint64_t win_packets[REPORT_STATS_STREAMS];
     uint64_t win_cc_errors[REPORT_STATS_STREAMS];
     uint64_t win_recovered;
@@ -282,6 +307,8 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
 
     update_stream_health(stats);
     report_stats_timestamp(timestamp, sizeof(timestamp));
+    report_stats_wall_time(last_recovery_event, sizeof(last_recovery_event),
+                           stats->last_recovery_event_time);
     compute_rolling_window(stats, win_packets, win_cc_errors,
                            &win_recovered, &win_unrecoverable, &win_output);
 
@@ -312,6 +339,7 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         "\"latency_ms\":{\"min\":%.3f,\"avg\":%.3f,\"max\":%.3f,\"jitter\":%.3f,\"samples\":%" PRIu64 "},"
         "\"stream_disagreements\":%" PRIu64 ","
         "\"primary_delay_overflows\":%" PRIu64 ","
+        "\"last_recovery_event\":\"%s\","
         "\"recovered_null_packets\":%" PRIu64 ","
         "\"recovered_content_packets\":%" PRIu64 ","
         "\"recovered_content_bursts\":%" PRIu64 ","
@@ -364,6 +392,7 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         stats->observed_secondary_latency_samples,
         stats->stream_disagreements,
         stats->primary_delay_overflows,
+        last_recovery_event,
         stats->recovered_null_packets,
         stats->recovered_content_packets,
         stats->recovered_content_bursts,

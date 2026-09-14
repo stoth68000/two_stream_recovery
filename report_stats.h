@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "ts_packet.h"
 
@@ -85,6 +86,7 @@ typedef struct report_stats {
     uint64_t output_packets;
     uint64_t output_continuity_errors;
     uint64_t output_duplicate_counters;
+    time_t last_recovery_event_time;
     uint64_t last_report_ns;
     report_stats_sample_t rolling_samples[REPORT_STATS_ROLLING_SECONDS];
     size_t rolling_index;
@@ -101,6 +103,7 @@ void report_stats_observe_output_datagram(report_stats_t *stats, bool short_flus
 void report_stats_observe_pcr_delay(report_stats_t *stats, double sample_ns);
 void report_stats_observe_latency(report_stats_t *stats, uint64_t primary_arrival_ns,
                                   uint64_t secondary_arrival_ns, uint64_t max_latency_ns);
+void report_stats_observe_recovery(report_stats_t *stats, bool is_null_packet);
 void report_stats_reject_recovery(report_stats_t *stats, recovery_reject_reason_t reason);
 int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_size);
 void report_stats_maybe_print(report_stats_t *stats, bool force);
