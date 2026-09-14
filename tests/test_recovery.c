@@ -551,6 +551,9 @@ static void test_counter_fallback_recovery_without_anchor(void)
 
     init_engine(&engine, &stats, &capture, &sink);
     engine.config.min_alignment_confidence = 0;
+    stats.pcr_timing_confidence[0] = 100;
+    stats.pcr_timing_confidence[1] = 100;
+    stats.pcr_delay_ns = -1900000000.0;
 
     make_packet(primary_a, 0x120, 0, 0x11);
     make_packet(secondary_b, 0x120, 1, 0x22);
@@ -750,6 +753,62 @@ static void test_stream_time_range_recovers_null_only_gap(void)
     assert(stats.recovered_null_packets == GAP_PACKETS);
     assert(stats.recovered_content_packets == 0);
     assert(stats.unrecoverable_loss == 0);
+    recovery_engine_free(&engine);
+}
+
+static void test_pid_time_range_recovery_wrap_gap(void)
+{
+    enum {
+        PID = 49,
+        GAP_PACKETS = 32
+    };
+    const uint64_t base_ns = 4000000000ULL;
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t primary_a[TS_PACKET_SIZE];
+    uint8_t primary_after[TS_PACKET_SIZE];
+    uint8_t secondary_gap[GAP_PACKETS][TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.config.min_alignment_confidence = 0;
+
+    make_packet(primary_a, PID, 0, 0x10);
+    push_packet(&engine, &stats, 0, primary_a);
+    assert(recovery_engine_flush(&engine) == 0);
+    engine.output_pid_state[PID].last_arrival_time_ns = base_ns;
+
+    for (i = 0; i < GAP_PACKETS; i++) {
+        size_t index;
+
+        make_packet(secondary_gap[i], PID, (uint8_t)((i + 1U) & 0x0fU),
+                    (uint8_t)(0x40 + i));
+        push_packet(&engine, &stats, 1, secondary_gap[i]);
+        index = (engine.history[1].start + engine.history[1].count - 1U) %
+                engine.history[1].capacity;
+        engine.history[1].records[index].arrival_time_ns =
+            base_ns + 1900000000ULL + ((uint64_t)(i + 1U) * 100000000ULL);
+    }
+
+    make_packet(primary_after, PID, 1, 0x70);
+    push_packet(&engine, &stats, 0, primary_after);
+    assert(engine.primary_queue.count == 1);
+    engine.primary_queue.records[engine.primary_queue.start].arrival_time_ns =
+        base_ns + 5000000000ULL;
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == 2 + GAP_PACKETS);
+    assert(memcmp(capture.packets[0], primary_a, TS_PACKET_SIZE) == 0);
+    for (i = 0; i < GAP_PACKETS; i++) {
+        assert(memcmp(capture.packets[1 + i], secondary_gap[i], TS_PACKET_SIZE) == 0);
+    }
+    assert(memcmp(capture.packets[1 + GAP_PACKETS], primary_after, TS_PACKET_SIZE) == 0);
+    assert(stats.recovered_packets == GAP_PACKETS);
+    assert(stats.recovered_content_packets == GAP_PACKETS);
+    assert(stats.recovered_content_bursts == 1);
+    assert(stats.output_continuity_errors == 0);
     recovery_engine_free(&engine);
 }
 
@@ -1285,6 +1344,7 @@ int main(void)
     test_stream_time_range_recovery();
     test_stream_time_range_skips_primary_boundary_twin();
     test_stream_time_range_recovers_null_only_gap();
+    test_pid_time_range_recovery_wrap_gap();
     test_secondary_loss_diagnosis();
     test_generated_parser_sweep();
     test_generated_content_recovery_sweep();

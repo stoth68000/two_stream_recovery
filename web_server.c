@@ -222,6 +222,9 @@ void web_server_handle_ready(web_server_t *server, report_stats_t *stats)
         if (client_fd < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 perror("accept http");
+                if (errno == ENOTSOCK || errno == EBADF) {
+                    web_server_close(server);
+                }
             }
             return;
         }

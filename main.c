@@ -101,6 +101,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
     packet_sink_t sink;
     web_server_t web_server;
     bool web_enabled = false;
+    int web_fd = -1;
 
     report_stats_init(&stats);
     memset(&web_server, 0, sizeof(web_server));
@@ -110,6 +111,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
             return -1;
         }
         web_enabled = true;
+        web_fd = web_server.fd;
     }
 
     sink = output_udp_as_packet_sink(output);
@@ -134,9 +136,9 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
             }
         }
         if (web_enabled) {
-            FD_SET(web_server.fd, &read_fds);
-            if (web_server.fd > max_fd) {
-                max_fd = web_server.fd;
+            FD_SET(web_fd, &read_fds);
+            if (web_fd > max_fd) {
+                max_fd = web_fd;
             }
         }
 
@@ -153,8 +155,11 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
             return -1;
         }
 
-        if (web_enabled && ready > 0 && FD_ISSET(web_server.fd, &read_fds)) {
+        if (web_enabled && ready > 0 && FD_ISSET(web_fd, &read_fds)) {
+            web_server.fd = web_fd;
             web_server_handle_ready(&web_server, &stats);
+            web_fd = web_server.fd;
+            web_enabled = web_fd >= 0;
         }
 
         for (i = 0; i < 2; i++) {

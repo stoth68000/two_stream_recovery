@@ -23,6 +23,8 @@
 #define RECOVERY_ENGINE_STREAM_GAP_TIME_MARGIN_NS 1000000ULL
 #define RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS 4096U
 #define RECOVERY_ENGINE_MIN_NULL_GAP_RECOVERY_PACKETS 7U
+#define RECOVERY_ENGINE_PID_GAP_MIN_NS 250000000ULL
+#define RECOVERY_ENGINE_MAX_PID_GAP_RECOVERY_PACKETS 131072U
 
 typedef struct recovery_engine_config {
     uint64_t primary_delay_ns;
@@ -58,6 +60,8 @@ typedef struct primary_gap_state {
 typedef struct output_pid_state {
     bool valid;
     uint8_t continuity_counter;
+    uint64_t last_arrival_time_ns;
+    uint64_t last_recovered_secondary_arrival_ns;
 } output_pid_state_t;
 
 typedef struct packet_record {

@@ -164,6 +164,7 @@ static void observe_output_record(recovery_engine_t *engine, const packet_record
 
     state->valid = true;
     state->continuity_counter = record->continuity_counter;
+    state->last_arrival_time_ns = record->arrival_time_ns;
 }
 
 static int output_record(recovery_engine_t *engine, const packet_record_t *record)
@@ -744,6 +745,120 @@ static int recover_stream_gap_before_primary(recovery_engine_t *engine,
     return recovered < 0 ? -1 : 0;
 }
 
+static int recover_pid_time_range(recovery_engine_t *engine,
+                                  output_pid_state_t *state,
+                                  const packet_record_t *primary,
+                                  uint64_t start_ns,
+                                  uint64_t end_ns)
+{
+    packet_history_t *secondary = &engine->history[1];
+    uint32_t recovered = 0;
+    size_t i;
+    bool started = false;
+
+    if (start_ns >= RECOVERY_ENGINE_STREAM_GAP_TIME_MARGIN_NS) {
+        start_ns -= RECOVERY_ENGINE_STREAM_GAP_TIME_MARGIN_NS;
+    } else {
+        start_ns = 0;
+    }
+    end_ns += RECOVERY_ENGINE_STREAM_GAP_TIME_MARGIN_NS;
+
+    for (i = 0; i < secondary->count; i++) {
+        size_t index = (secondary->start + i) % secondary->capacity;
+        packet_record_t *candidate = &secondary->records[index];
+
+        if (candidate->arrival_time_ns <= start_ns ||
+            candidate->arrival_time_ns >= end_ns ||
+            candidate->arrival_time_ns <= state->last_recovered_secondary_arrival_ns) {
+            continue;
+        }
+        if (candidate->pid != primary->pid || candidate->is_null) {
+            continue;
+        }
+        if (candidate->hash == primary->hash) {
+            if (started) {
+                break;
+            }
+            continue;
+        }
+        if (candidate->transport_error) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_TEI);
+            continue;
+        }
+        if (candidate->discontinuity_indicator || !candidate->has_payload) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_DISCONTINUITY);
+            continue;
+        }
+        if (!record_fits_next_output(engine, candidate)) {
+            if (started) {
+                break;
+            }
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
+            continue;
+        }
+
+        started = true;
+        recovered++;
+        if (recovered > RECOVERY_ENGINE_MAX_PID_GAP_RECOVERY_PACKETS) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_BURST_TOO_LARGE);
+            return 0;
+        }
+        if (output_record(engine, candidate) != 0) {
+            return -1;
+        }
+        engine->stats->recovered_packets++;
+        engine->stats->recovered_content_packets++;
+        state->last_recovered_secondary_arrival_ns = candidate->arrival_time_ns;
+    }
+
+    if (recovered > 1) {
+        engine->stats->recovered_content_bursts++;
+    }
+
+    return (int)recovered;
+}
+
+static int recover_pid_gap_before_primary(recovery_engine_t *engine,
+                                          const packet_record_t *primary)
+{
+    output_pid_state_t *state;
+    uint64_t primary_gap_ns;
+    int64_t offset_ns;
+    int recovered;
+
+    if (primary->is_null || primary->transport_error ||
+        primary->discontinuity_indicator || !primary->has_payload) {
+        return 0;
+    }
+
+    state = &engine->output_pid_state[primary->pid];
+    if (!state->valid || primary->arrival_time_ns <= state->last_arrival_time_ns) {
+        return 0;
+    }
+
+    primary_gap_ns = primary->arrival_time_ns - state->last_arrival_time_ns;
+    if (primary_gap_ns < RECOVERY_ENGINE_PID_GAP_MIN_NS) {
+        return 0;
+    }
+
+    offset_ns = estimated_secondary_time_offset_ns(engine);
+    recovered = recover_pid_time_range(engine, state, primary,
+                                       apply_time_offset(state->last_arrival_time_ns, offset_ns),
+                                       apply_time_offset(primary->arrival_time_ns, offset_ns));
+    if (recovered == 0 && offset_ns != 0) {
+        recovered = recover_pid_time_range(engine, state, primary,
+                                           apply_time_offset(state->last_arrival_time_ns, -offset_ns),
+                                           apply_time_offset(primary->arrival_time_ns, -offset_ns));
+    }
+    if (recovered == 0 && offset_ns != 0) {
+        recovered = recover_pid_time_range(engine, state, primary,
+                                           state->last_arrival_time_ns,
+                                           primary->arrival_time_ns);
+    }
+
+    return recovered < 0 ? -1 : 0;
+}
+
 static int recover_content_burst_before_primary(recovery_engine_t *engine, const packet_record_t *primary,
                                                 const packet_record_t *secondary_match)
 {
@@ -1170,6 +1285,10 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 
         secondary_match = find_secondary_match_for_primary(engine, record);
         if (recover_nulls_before_primary(engine, record, secondary_match) != 0) {
+            return -1;
+        }
+
+        if (recover_pid_gap_before_primary(engine, record) != 0) {
             return -1;
         }
 
