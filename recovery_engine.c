@@ -248,6 +248,76 @@ static uint64_t pcr_delta(uint64_t later, uint64_t earlier)
     return (wrap - earlier) + later;
 }
 
+static int64_t signed_pcr_delta(uint64_t later, uint64_t earlier)
+{
+    uint64_t forward = pcr_delta(later, earlier);
+    uint64_t backward = pcr_delta(earlier, later);
+
+    return forward <= backward ? (int64_t)forward : -(int64_t)backward;
+}
+
+static double pcr_ticks_to_ns(int64_t ticks)
+{
+    return ((double)ticks / 27000000.0) * 1000000000.0;
+}
+
+static void observe_pcr_arrival_delay(recovery_engine_t *engine, int stream_id,
+                                      const packet_record_t *record)
+{
+    packet_history_t *history = &engine->history[stream_id == 0 ? 1 : 0];
+    packet_record_t *best = NULL;
+    uint64_t best_pcr_delta = UINT64_MAX;
+    size_t max_search = history->count < RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS
+                            ? history->count
+                            : RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS;
+    size_t i;
+
+    if (!record->has_pcr) {
+        return;
+    }
+
+    for (i = 0; i < max_search; i++) {
+        packet_record_t *candidate = packet_history_get_newest(history, i);
+        int64_t pcr_delta_ticks;
+        uint64_t pcr_delta_abs;
+
+        if (candidate == NULL) {
+            break;
+        }
+        if (!candidate->has_pcr || candidate->pid != record->pid) {
+            continue;
+        }
+        if (engine->config.alignment_window_ns > 0 &&
+            time_difference_ns(record->arrival_time_ns, candidate->arrival_time_ns) >
+                engine->config.alignment_window_ns) {
+            continue;
+        }
+
+        pcr_delta_ticks = signed_pcr_delta(record->pcr_value, candidate->pcr_value);
+        pcr_delta_abs = pcr_delta_ticks >= 0 ? (uint64_t)pcr_delta_ticks : (uint64_t)-pcr_delta_ticks;
+        if (pcr_delta_abs < best_pcr_delta) {
+            best_pcr_delta = pcr_delta_abs;
+            best = candidate;
+        }
+    }
+
+    if (best != NULL) {
+        double sample_ns;
+
+        if (stream_id == 0) {
+            sample_ns = ((double)best->arrival_time_ns - (double)record->arrival_time_ns) -
+                        pcr_ticks_to_ns(signed_pcr_delta(best->pcr_value, record->pcr_value));
+        } else {
+            sample_ns = ((double)record->arrival_time_ns - (double)best->arrival_time_ns) -
+                        pcr_ticks_to_ns(signed_pcr_delta(record->pcr_value, best->pcr_value));
+        }
+        if (engine->config.max_secondary_latency_ns == 0 ||
+            sample_ns <= (double)engine->config.max_secondary_latency_ns) {
+            report_stats_observe_pcr_delay(engine->stats, sample_ns);
+        }
+    }
+}
+
 static pcr_pid_model_t *get_pcr_pid_model(pcr_timing_model_t *model, uint16_t pid)
 {
     pcr_pid_model_t *empty = NULL;
@@ -291,11 +361,6 @@ static void refresh_pcr_summary(recovery_engine_t *engine)
         engine->pcr_model[stream_id].confidence = best_confidence;
         engine->stats->pcr_timing_confidence[stream_id] = best_confidence;
         engine->stats->pcr_bitrate_bps[stream_id] = best_bitrate;
-    }
-
-    if (engine->pcr_model[0].confidence > 0 && engine->pcr_model[1].confidence > 0) {
-        engine->stats->pcr_delay_ns = engine->pcr_model[1].estimated_delay_ns -
-                                      engine->pcr_model[0].estimated_delay_ns;
     }
 }
 
@@ -358,6 +423,7 @@ static void update_pcr_timing(recovery_engine_t *engine, int stream_id, const pa
             (double)record->arrival_time_ns;
     }
 
+    observe_pcr_arrival_delay(engine, stream_id, record);
     refresh_pcr_summary(engine);
 }
 

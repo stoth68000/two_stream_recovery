@@ -90,17 +90,8 @@ void report_stats_observe_output_datagram(report_stats_t *stats, bool short_flus
     }
 }
 
-void report_stats_observe_latency(report_stats_t *stats, uint64_t primary_arrival_ns,
-                                  uint64_t secondary_arrival_ns, uint64_t max_latency_ns)
+static void report_stats_observe_latency_sample(report_stats_t *stats, double sample_ns)
 {
-    double sample_ns;
-
-    if (secondary_arrival_ns < primary_arrival_ns) {
-        sample_ns = 0.0;
-    } else {
-        sample_ns = (double)(secondary_arrival_ns - primary_arrival_ns);
-    }
-
     if (stats->observed_secondary_latency_samples == 0 ||
         sample_ns < stats->observed_secondary_latency_min_ns) {
         stats->observed_secondary_latency_min_ns = sample_ns;
@@ -123,6 +114,32 @@ void report_stats_observe_latency(report_stats_t *stats, uint64_t primary_arriva
         stats->observed_secondary_latency_jitter_ns =
             (stats->observed_secondary_latency_jitter_ns * 0.875) + (diff * 0.125);
     }
+}
+
+void report_stats_observe_pcr_delay(report_stats_t *stats, double sample_ns)
+{
+    stats->pcr_delay_samples++;
+    if (stats->pcr_delay_samples == 1) {
+        stats->pcr_delay_ns = sample_ns;
+    } else {
+        stats->pcr_delay_ns = (stats->pcr_delay_ns * 0.875) + (sample_ns * 0.125);
+    }
+
+    report_stats_observe_latency_sample(stats, sample_ns < 0.0 ? -sample_ns : sample_ns);
+}
+
+void report_stats_observe_latency(report_stats_t *stats, uint64_t primary_arrival_ns,
+                                  uint64_t secondary_arrival_ns, uint64_t max_latency_ns)
+{
+    double sample_ns;
+
+    if (secondary_arrival_ns < primary_arrival_ns) {
+        sample_ns = 0.0;
+    } else {
+        sample_ns = (double)(secondary_arrival_ns - primary_arrival_ns);
+    }
+
+    report_stats_observe_latency_sample(stats, sample_ns);
 
     if (max_latency_ns > 0 && sample_ns > (double)max_latency_ns) {
         stats->secondary_packets_too_late++;
@@ -291,6 +308,7 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         "\"pcr_timing_confidence\":[%u,%u],"
         "\"pcr_bitrate_bps\":[%.0f,%.0f],"
         "\"pcr_delay_ns\":%.0f,"
+        "\"pcr_delay_samples\":%" PRIu64 ","
         "\"latency_ms\":{\"min\":%.3f,\"avg\":%.3f,\"max\":%.3f,\"jitter\":%.3f,\"samples\":%" PRIu64 "},"
         "\"stream_disagreements\":%" PRIu64 ","
         "\"primary_delay_overflows\":%" PRIu64 ","
@@ -338,6 +356,7 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         stats->pcr_timing_confidence[0], stats->pcr_timing_confidence[1],
         stats->pcr_bitrate_bps[0], stats->pcr_bitrate_bps[1],
         stats->pcr_delay_ns,
+        stats->pcr_delay_samples,
         stats->observed_secondary_latency_min_ns / 1000000.0,
         stats->observed_secondary_latency_avg_ns / 1000000.0,
         stats->observed_secondary_latency_max_ns / 1000000.0,

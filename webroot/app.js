@@ -22,6 +22,20 @@ function healthClass(health) {
   return "bad";
 }
 
+function outputHealth(data) {
+  return (data.output_continuity_errors || data.output_duplicate_counters) ? "degraded" : "healthy";
+}
+
+function renderStreamRow(name, health, cells) {
+  return `
+    <tr>
+      <td>${name}</td>
+      <td><span class="pill ${healthClass(health)}">${health}</span></td>
+      ${cells.map((cell) => `<td>${cell}</td>`).join("")}
+    </tr>
+  `;
+}
+
 function renderDefinitionList(id, rows) {
   const node = document.getElementById(id);
   node.innerHTML = rows.map(([label, val]) => `<dt>${label}</dt><dd>${val}</dd>`).join("");
@@ -43,22 +57,28 @@ function render(data) {
   status.textContent = "live";
   status.className = "pill good";
 
-  document.getElementById("streams").innerHTML = [0, 1].map((idx) => {
+  const streamRows = [0, 1].map((idx) => {
     const health = value(["health", idx], data, "unknown");
-    return `
-      <tr>
-        <td>${idx === 0 ? "Primary" : "Secondary"}</td>
-        <td><span class="pill ${healthClass(health)}">${health}</span></td>
-        <td>${fmt(value(["packets_received", idx], data))}</td>
-        <td>${fmt(value(["win60_packets", idx], data))}</td>
-        <td>${fmt(value(["continuity_errors", idx], data))}</td>
-        <td>${fmt(value(["transport_errors", idx], data))}</td>
-        <td>${fmt(value(["sync_errors", idx], data))}</td>
-        <td>${fmt(value(["input_datagrams", idx], data))}</td>
-        <td>${fmt(value(["pcr_packets", idx], data))}</td>
-      </tr>
-    `;
-  }).join("");
+    return renderStreamRow(idx === 0 ? "Primary" : "Secondary", health, [
+      fmt(value(["packets_received", idx], data)),
+      fmt(value(["win60_packets", idx], data)),
+      fmt(value(["continuity_errors", idx], data)),
+      fmt(value(["transport_errors", idx], data)),
+      fmt(value(["sync_errors", idx], data)),
+      fmt(value(["input_datagrams", idx], data)),
+      fmt(value(["pcr_packets", idx], data))
+    ]);
+  });
+  streamRows.push(renderStreamRow("Output", outputHealth(data), [
+    fmt(data.output_packets),
+    fmt(data.win60_output),
+    fmt(data.output_continuity_errors),
+    "-",
+    "-",
+    fmt(data.output_datagrams),
+    "-"
+  ]));
+  document.getElementById("streams").innerHTML = streamRows.join("");
 
   renderDefinitionList("recovery", [
     ["Content packets", fmt(data.recovered_content_packets)],
@@ -77,7 +97,7 @@ function render(data) {
     ["Max", fmtMs(value(["latency_ms", "max"], data))],
     ["Jitter", fmtMs(value(["latency_ms", "jitter"], data))],
     ["Samples", fmt(value(["latency_ms", "samples"], data))],
-    ["PCR delay", `${fmt(Math.round(data.pcr_delay_ns || 0))} ns`],
+    ["PCR delay", fmtMs(Math.abs(data.pcr_delay_ns || 0) / 1000000)],
     ["Too late", fmt(data.secondary_packets_too_late)],
     ["Primary delay short", fmt(data.primary_delay_insufficient)]
   ]);

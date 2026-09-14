@@ -437,6 +437,14 @@ static void test_report_stats_observe_edges(void)
     assert(ts_packet_parse(packet, &info));
     report_stats_observe_packet(&stats, 1, &info);
     assert(stats.transport_errors[1] == 1);
+
+    report_stats_observe_pcr_delay(&stats, -2000000000.0);
+    assert(stats.pcr_delay_samples == 1);
+    assert(stats.pcr_delay_ns == -2000000000.0);
+    assert(stats.observed_secondary_latency_samples == 1);
+    assert(stats.observed_secondary_latency_min_ns == 2000000000.0);
+    assert(stats.observed_secondary_latency_avg_ns == 2000000000.0);
+    assert(stats.observed_secondary_latency_max_ns == 2000000000.0);
 }
 
 static void test_primary_pass_through(void)

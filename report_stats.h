@@ -66,6 +66,7 @@ typedef struct report_stats {
     uint32_t pcr_timing_confidence[REPORT_STATS_STREAMS];
     double pcr_bitrate_bps[REPORT_STATS_STREAMS];
     double pcr_delay_ns;
+    uint64_t pcr_delay_samples;
     double observed_secondary_latency_min_ns;
     double observed_secondary_latency_avg_ns;
     double observed_secondary_latency_max_ns;
@@ -97,6 +98,7 @@ void report_stats_init(report_stats_t *stats);
 void report_stats_observe_datagram(report_stats_t *stats, int stream_id, size_t bytes);
 void report_stats_observe_packet(report_stats_t *stats, int stream_id, const ts_packet_info_t *info);
 void report_stats_observe_output_datagram(report_stats_t *stats, bool short_flush);
+void report_stats_observe_pcr_delay(report_stats_t *stats, double sample_ns);
 void report_stats_observe_latency(report_stats_t *stats, uint64_t primary_arrival_ns,
                                   uint64_t secondary_arrival_ns, uint64_t max_latency_ns);
 void report_stats_reject_recovery(report_stats_t *stats, recovery_reject_reason_t reason);
