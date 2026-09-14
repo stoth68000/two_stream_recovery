@@ -35,6 +35,10 @@ void command_line_print_usage(const char *program_name)
             "  --output-url <url>\n"
             "      UDP destination for recovered output. Default: %s\n"
             "\n"
+            "  --http-port <number>\n"
+            "      Enable the REST stats API and web UI on 127.0.0.1:<number>.\n"
+            "      Default: disabled\n"
+            "\n"
             "  --primary-delay-ms <ms>\n"
             "      Milliseconds to delay stream #1 before output, allowing stream #2 time to arrive.\n"
             "      Default: %llu\n"
@@ -142,6 +146,7 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
         uint64_t *u64_target = NULL;
         uint32_t *u32_target = NULL;
         uint32_t u32_max = UINT32_MAX;
+        bool is_http_port = false;
 
         if (strcmp(name, "--input-primary-url") == 0) {
             target = &options->input_primary_url;
@@ -153,6 +158,17 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
             target = &options->input_secondary_interface;
         } else if (strcmp(name, "--output-url") == 0) {
             target = &options->output_url;
+        } else if (strcmp(name, "--http-port") == 0) {
+            if (options->http_port != 0) {
+                if (print_errors) {
+                    fprintf(stderr, "duplicate option: %s\n", name);
+                    command_line_print_usage(argv[0]);
+                }
+                return -1;
+            }
+            u32_target = &u32_max;
+            u32_max = 65535U;
+            is_http_port = true;
         } else if (strcmp(name, "--primary-delay-ms") == 0) {
             ms_target_ns = &options->recovery_config.primary_delay_ns;
         } else if (strcmp(name, "--max-secondary-latency-ms") == 0) {
@@ -207,11 +223,21 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
             continue;
         }
         if (u32_target != NULL) {
-            if (parse_u32_option(name, argv[++i], u32_target, u32_max, print_errors) != 0) {
+            uint32_t parsed = 0;
+            if (parse_u32_option(name, argv[++i], &parsed, u32_max, print_errors) != 0 ||
+                (is_http_port && parsed == 0)) {
                 if (print_errors) {
+                    if (is_http_port && parsed == 0) {
+                        fprintf(stderr, "invalid TCP port for %s: %s\n", name, argv[i]);
+                    }
                     command_line_print_usage(argv[0]);
                 }
                 return -1;
+            }
+            if (is_http_port) {
+                options->http_port = (uint16_t)parsed;
+            } else {
+                *u32_target = parsed;
             }
             continue;
         }

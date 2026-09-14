@@ -152,6 +152,16 @@ static const char *stream_health_name(stream_health_t health)
     return "unknown";
 }
 
+static void report_stats_timestamp(char *timestamp, size_t timestamp_size)
+{
+    time_t wall_time;
+    struct tm local_tm;
+
+    wall_time = time(NULL);
+    localtime_r(&wall_time, &local_tm);
+    strftime(timestamp, timestamp_size, "%Y-%m-%d %H:%M:%S %z", &local_tm);
+}
+
 static void update_stream_health(report_stats_t *stats)
 {
     int stream_id;
@@ -213,13 +223,168 @@ static const report_stats_sample_t *oldest_rolling_sample(const report_stats_t *
     return &stats->rolling_samples[stats->rolling_index];
 }
 
+static void compute_rolling_window(const report_stats_t *stats,
+                                   uint64_t win_packets[REPORT_STATS_STREAMS],
+                                   uint64_t win_cc_errors[REPORT_STATS_STREAMS],
+                                   uint64_t *win_recovered,
+                                   uint64_t *win_unrecoverable,
+                                   uint64_t *win_output)
+{
+    const report_stats_sample_t *oldest = oldest_rolling_sample(stats);
+
+    win_packets[0] = 0;
+    win_packets[1] = 0;
+    win_cc_errors[0] = 0;
+    win_cc_errors[1] = 0;
+    *win_recovered = 0;
+    *win_unrecoverable = 0;
+    *win_output = 0;
+
+    if (oldest == NULL) {
+        return;
+    }
+
+    win_packets[0] = stats->packets_received[0] - oldest->packets_received[0];
+    win_packets[1] = stats->packets_received[1] - oldest->packets_received[1];
+    win_cc_errors[0] = stats->continuity_errors[0] - oldest->continuity_errors[0];
+    win_cc_errors[1] = stats->continuity_errors[1] - oldest->continuity_errors[1];
+    *win_recovered = stats->recovered_packets - oldest->recovered_packets;
+    *win_unrecoverable = stats->unrecoverable_loss - oldest->unrecoverable_loss;
+    *win_output = stats->output_packets - oldest->output_packets;
+}
+
+int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_size)
+{
+    char timestamp[64];
+    uint64_t win_packets[REPORT_STATS_STREAMS];
+    uint64_t win_cc_errors[REPORT_STATS_STREAMS];
+    uint64_t win_recovered;
+    uint64_t win_unrecoverable;
+    uint64_t win_output;
+    int written;
+
+    update_stream_health(stats);
+    report_stats_timestamp(timestamp, sizeof(timestamp));
+    compute_rolling_window(stats, win_packets, win_cc_errors,
+                           &win_recovered, &win_unrecoverable, &win_output);
+
+    written = snprintf(
+        buffer, buffer_size,
+        "{"
+        "\"timestamp\":\"%s\","
+        "\"packets_received\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"win60_packets\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"input_datagrams\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"malformed_datagrams\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"partial_datagrams\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"resync_events\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"sync_errors\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"transport_errors\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"continuity_errors\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"win60_continuity_errors\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"health\":[\"%s\",\"%s\"],"
+        "\"duplicate_counters\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"null_packets\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"pcr_packets\":[%" PRIu64 ",%" PRIu64 "],"
+        "\"alignment_offset_packets\":%" PRId64 ","
+        "\"alignment_confidence\":%u,"
+        "\"pcr_timing_confidence\":[%u,%u],"
+        "\"pcr_bitrate_bps\":[%.0f,%.0f],"
+        "\"pcr_delay_ns\":%.0f,"
+        "\"latency_ms\":{\"min\":%.3f,\"avg\":%.3f,\"max\":%.3f,\"jitter\":%.3f,\"samples\":%" PRIu64 "},"
+        "\"stream_disagreements\":%" PRIu64 ","
+        "\"primary_delay_overflows\":%" PRIu64 ","
+        "\"recovered_null_packets\":%" PRIu64 ","
+        "\"recovered_content_packets\":%" PRIu64 ","
+        "\"recovered_content_bursts\":%" PRIu64 ","
+        "\"unrecoverable_null_regions\":%" PRIu64 ","
+        "\"secondary_loss_events\":%" PRIu64 ","
+        "\"secondary_missing_packets\":%" PRIu64 ","
+        "\"secondary_missing_anchors\":%" PRIu64 ","
+        "\"secondary_packets_too_late\":%" PRIu64 ","
+        "\"primary_delay_insufficient\":%" PRIu64 ","
+        "\"recovery_rejects\":{\"low_alignment\":%" PRIu64 ",\"secondary_late\":%" PRIu64
+        ",\"tei\":%" PRIu64 ",\"discontinuity\":%" PRIu64 ",\"wrong_pid\":%" PRIu64
+        ",\"wrong_counter\":%" PRIu64 ",\"ambiguous\":%" PRIu64 ",\"burst_too_large\":%" PRIu64
+        ",\"missing_candidate\":%" PRIu64 "},"
+        "\"recovery_exact_cc_gap\":%" PRIu64 ","
+        "\"recovered_packets\":%" PRIu64 ","
+        "\"unrecoverable_loss\":%" PRIu64 ","
+        "\"win60_recovered\":%" PRIu64 ","
+        "\"win60_unrecoverable\":%" PRIu64 ","
+        "\"output_packets\":%" PRIu64 ","
+        "\"win60_output\":%" PRIu64 ","
+        "\"output_continuity_errors\":%" PRIu64 ","
+        "\"output_duplicate_counters\":%" PRIu64 ","
+        "\"output_datagrams\":%" PRIu64 ","
+        "\"output_short_flushes\":%" PRIu64
+        "}",
+        timestamp,
+        stats->packets_received[0], stats->packets_received[1],
+        win_packets[0], win_packets[1],
+        stats->input_datagrams[0], stats->input_datagrams[1],
+        stats->malformed_datagrams[0], stats->malformed_datagrams[1],
+        stats->partial_datagrams[0], stats->partial_datagrams[1],
+        stats->resync_events[0], stats->resync_events[1],
+        stats->sync_errors[0], stats->sync_errors[1],
+        stats->transport_errors[0], stats->transport_errors[1],
+        stats->continuity_errors[0], stats->continuity_errors[1],
+        win_cc_errors[0], win_cc_errors[1],
+        stream_health_name(stats->stream_health[0]), stream_health_name(stats->stream_health[1]),
+        stats->duplicate_counters[0], stats->duplicate_counters[1],
+        stats->null_packets[0], stats->null_packets[1],
+        stats->pcr_packets[0], stats->pcr_packets[1],
+        stats->alignment_offset_packets, stats->alignment_confidence,
+        stats->pcr_timing_confidence[0], stats->pcr_timing_confidence[1],
+        stats->pcr_bitrate_bps[0], stats->pcr_bitrate_bps[1],
+        stats->pcr_delay_ns,
+        stats->observed_secondary_latency_min_ns / 1000000.0,
+        stats->observed_secondary_latency_avg_ns / 1000000.0,
+        stats->observed_secondary_latency_max_ns / 1000000.0,
+        stats->observed_secondary_latency_jitter_ns / 1000000.0,
+        stats->observed_secondary_latency_samples,
+        stats->stream_disagreements,
+        stats->primary_delay_overflows,
+        stats->recovered_null_packets,
+        stats->recovered_content_packets,
+        stats->recovered_content_bursts,
+        stats->unrecoverable_null_regions,
+        stats->secondary_loss_events,
+        stats->secondary_missing_packets,
+        stats->secondary_missing_anchors,
+        stats->secondary_packets_too_late,
+        stats->primary_delay_insufficient,
+        stats->recovery_rejects[RECOVERY_REJECT_LOW_ALIGNMENT],
+        stats->recovery_rejects[RECOVERY_REJECT_SECONDARY_LATE],
+        stats->recovery_rejects[RECOVERY_REJECT_TEI],
+        stats->recovery_rejects[RECOVERY_REJECT_DISCONTINUITY],
+        stats->recovery_rejects[RECOVERY_REJECT_WRONG_PID],
+        stats->recovery_rejects[RECOVERY_REJECT_WRONG_COUNTER],
+        stats->recovery_rejects[RECOVERY_REJECT_AMBIGUOUS],
+        stats->recovery_rejects[RECOVERY_REJECT_BURST_TOO_LARGE],
+        stats->recovery_rejects[RECOVERY_REJECT_MISSING_CANDIDATE],
+        stats->recovery_exact_cc_gap,
+        stats->recovered_packets,
+        stats->unrecoverable_loss,
+        win_recovered,
+        win_unrecoverable,
+        stats->output_packets,
+        win_output,
+        stats->output_continuity_errors,
+        stats->output_duplicate_counters,
+        stats->output_datagrams,
+        stats->output_short_flushes);
+
+    if (written < 0 || (size_t)written >= buffer_size) {
+        return -1;
+    }
+    return written;
+}
+
 void report_stats_maybe_print(report_stats_t *stats, bool force)
 {
     uint64_t now_ns = report_stats_now_ns();
-    time_t wall_time;
-    struct tm local_tm;
     char timestamp[64];
-    const report_stats_sample_t *oldest;
     uint64_t win_packets[REPORT_STATS_STREAMS] = {0, 0};
     uint64_t win_cc_errors[REPORT_STATS_STREAMS] = {0, 0};
     uint64_t win_recovered = 0;
@@ -232,20 +397,9 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
 
     update_stream_health(stats);
     capture_rolling_sample(stats);
-    oldest = oldest_rolling_sample(stats);
-    if (oldest != NULL) {
-        win_packets[0] = stats->packets_received[0] - oldest->packets_received[0];
-        win_packets[1] = stats->packets_received[1] - oldest->packets_received[1];
-        win_cc_errors[0] = stats->continuity_errors[0] - oldest->continuity_errors[0];
-        win_cc_errors[1] = stats->continuity_errors[1] - oldest->continuity_errors[1];
-        win_recovered = stats->recovered_packets - oldest->recovered_packets;
-        win_unrecoverable = stats->unrecoverable_loss - oldest->unrecoverable_loss;
-        win_output = stats->output_packets - oldest->output_packets;
-    }
-
-    wall_time = time(NULL);
-    localtime_r(&wall_time, &local_tm);
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S %z", &local_tm);
+    compute_rolling_window(stats, win_packets, win_cc_errors,
+                           &win_recovered, &win_unrecoverable, &win_output);
+    report_stats_timestamp(timestamp, sizeof(timestamp));
 
     printf("%s packets_rx=[%" PRIu64 ",%" PRIu64 "] win60_packets=[%" PRIu64 ",%" PRIu64 "] "
            "input_datagrams=[%" PRIu64 ",%" PRIu64 "] malformed_datagrams=[%" PRIu64 ",%" PRIu64 "] "
@@ -257,7 +411,7 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            "pcr=[%" PRIu64 ",%" PRIu64 "] align_offset=%" PRId64 " align_confidence=%u "
            "pcr_confidence=[%u,%u] pcr_bitrate_bps=[%.0f,%.0f] pcr_delay_ns=%.0f "
            "latency_ms=[min=%.3f,avg=%.3f,max=%.3f,jitter=%.3f,samples=%" PRIu64 "] "
-           "disagreements=%" PRIu64 " delay_overflows=%" PRIu64 " recovered_null=%" PRIu64
+           "disagreements=%" PRIu64 " delay_overflows=%" PRIu64 " recovered_null=%" PRIu64 " "
            "recovered_content=%" PRIu64 " recovered_bursts=%" PRIu64
            " unrecoverable_null_regions=%" PRIu64
            " secondary_loss_events=%" PRIu64 " secondary_missing_packets=%" PRIu64
@@ -268,7 +422,9 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            ",burst=%" PRIu64 ",missing=%" PRIu64 "] exact_cc_gap=%" PRIu64
            " recovered=%" PRIu64 " unrecoverable=%" PRIu64
            " win60_recovered=%" PRIu64 " win60_unrecoverable=%" PRIu64
-           " output=%" PRIu64 " win60_output=%" PRIu64 " output_datagrams=%" PRIu64
+           " output=%" PRIu64 " win60_output=%" PRIu64
+           " output_cc_errors=%" PRIu64 " output_duplicate_cc=%" PRIu64
+           " output_datagrams=%" PRIu64
            " output_short_flushes=%" PRIu64 "\n",
            timestamp,
            stats->packets_received[0], stats->packets_received[1],
@@ -312,6 +468,7 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            stats->recovered_packets, stats->unrecoverable_loss,
            win_recovered, win_unrecoverable,
            stats->output_packets, win_output,
+           stats->output_continuity_errors, stats->output_duplicate_counters,
            stats->output_datagrams, stats->output_short_flushes);
     fflush(stdout);
 

@@ -19,6 +19,10 @@
 #define RECOVERY_ENGINE_DEFAULT_MIN_ALIGNMENT_CONFIDENCE 40U
 #define RECOVERY_ENGINE_MAX_PCR_PIDS 32
 #define RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS 15U
+#define RECOVERY_ENGINE_STREAM_GAP_MIN_NS 10000000ULL
+#define RECOVERY_ENGINE_STREAM_GAP_TIME_MARGIN_NS 1000000ULL
+#define RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS 4096U
+#define RECOVERY_ENGINE_MIN_NULL_GAP_RECOVERY_PACKETS 7U
 
 typedef struct recovery_engine_config {
     uint64_t primary_delay_ns;
@@ -43,6 +47,14 @@ typedef struct primary_anchor {
     uint64_t secondary_index;
 } primary_anchor_t;
 
+typedef struct primary_gap_state {
+    bool valid;
+    uint64_t arrival_time_ns;
+    uint64_t last_recovered_secondary_arrival_ns;
+    uint64_t recovered_stream_packets;
+    uint64_t continuity_errors;
+} primary_gap_state_t;
+
 typedef struct output_pid_state {
     bool valid;
     uint8_t continuity_counter;
@@ -58,6 +70,7 @@ typedef struct packet_record {
     bool is_null;
     bool transport_error;
     bool discontinuity_indicator;
+    uint64_t stream_continuity_errors;
     uint64_t pcr_value;
     uint64_t hash;
     uint8_t packet[TS_PACKET_SIZE];
@@ -106,6 +119,7 @@ typedef struct recovery_engine {
     uint64_t next_stream_index[2];
     alignment_state_t alignment;
     primary_anchor_t last_primary_anchor;
+    primary_gap_state_t primary_gap;
     output_pid_state_t output_pid_state[REPORT_STATS_PIDS];
 } recovery_engine_t;
 

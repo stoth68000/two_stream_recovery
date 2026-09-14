@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Two Stream Recovery Stats</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>Two Stream Recovery</h1>
+        <p id="timestamp">Waiting for stats...</p>
+      </div>
+      <div class="status-row">
+        <span id="api-status" class="pill warn">connecting</span>
+        <span id="alignment" class="pill">alignment 0%</span>
+      </div>
+    </header>
+
+    <section class="summary-grid">
+      <article class="metric-card">
+        <span>Recovered</span>
+        <strong id="recovered_packets">0</strong>
+        <small id="win60_recovered">60s 0</small>
+      </article>
+      <article class="metric-card">
+        <span>Unrecoverable</span>
+        <strong id="unrecoverable_loss">0</strong>
+        <small id="win60_unrecoverable">60s 0</small>
+      </article>
+      <article class="metric-card">
+        <span>Output Packets</span>
+        <strong id="output_packets">0</strong>
+        <small id="win60_output">60s 0</small>
+      </article>
+      <article class="metric-card">
+        <span>Latency Avg</span>
+        <strong id="latency_avg">0 ms</strong>
+        <small id="latency_jitter">jitter 0 ms</small>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">
+        <h2>Streams</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Stream</th>
+              <th>Health</th>
+              <th>Packets</th>
+              <th>Win60</th>
+              <th>CC Errors</th>
+              <th>TEI</th>
+              <th>Sync</th>
+              <th>Datagrams</th>
+              <th>PCR</th>
+            </tr>
+          </thead>
+          <tbody id="streams"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="details-grid">
+      <article class="panel">
+        <h2>Recovery</h2>
+        <dl id="recovery"></dl>
+      </article>
+      <article class="panel">
+        <h2>Latency</h2>
+        <dl id="latency"></dl>
+      </article>
+      <article class="panel">
+        <h2>Rejects</h2>
+        <dl id="rejects"></dl>
+      </article>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

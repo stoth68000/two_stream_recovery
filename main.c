@@ -4,6 +4,7 @@
 #include "recovery_engine.h"
 #include "report_stats.h"
 #include "ts_packet.h"
+#include "web_server.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -92,17 +93,29 @@ static int process_datagram(recovery_engine_t *engine, report_stats_t *stats, in
 }
 
 static int run_loop(input_udp_t inputs[2], output_udp_t *output,
-                    const recovery_engine_config_t *recovery_config)
+                    const recovery_engine_config_t *recovery_config, uint16_t http_port)
 {
     uint8_t buffer[INPUT_BUFFER_SIZE];
     report_stats_t stats;
     recovery_engine_t engine;
     packet_sink_t sink;
+    web_server_t web_server;
+    bool web_enabled = false;
 
     report_stats_init(&stats);
+    memset(&web_server, 0, sizeof(web_server));
+    web_server.fd = -1;
+    if (http_port != 0) {
+        if (web_server_open(&web_server, http_port, "webroot") != 0) {
+            return -1;
+        }
+        web_enabled = true;
+    }
+
     sink = output_udp_as_packet_sink(output);
     if (recovery_engine_init_with_config(&engine, &sink, &stats, recovery_config) != 0) {
         fprintf(stderr, "failed to initialize recovery engine\n");
+        web_server_close(&web_server);
         return -1;
     }
 
@@ -120,6 +133,12 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
                 max_fd = inputs[i].fd;
             }
         }
+        if (web_enabled) {
+            FD_SET(web_server.fd, &read_fds);
+            if (web_server.fd > max_fd) {
+                max_fd = web_server.fd;
+            }
+        }
 
         timeout.tv_sec = 0;
         timeout.tv_usec = 100000;
@@ -130,7 +149,12 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
             }
             perror("select");
             recovery_engine_free(&engine);
+            web_server_close(&web_server);
             return -1;
+        }
+
+        if (web_enabled && ready > 0 && FD_ISSET(web_server.fd, &read_fds)) {
+            web_server_handle_ready(&web_server, &stats);
         }
 
         for (i = 0; i < 2; i++) {
@@ -144,6 +168,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
                 if (received > 0 &&
                     process_datagram(&engine, &stats, i, buffer, (size_t)received) != 0) {
                     recovery_engine_free(&engine);
+                    web_server_close(&web_server);
                     return -1;
                 }
             }
@@ -151,6 +176,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
 
         if (recovery_engine_drain(&engine, false) != 0) {
             recovery_engine_free(&engine);
+            web_server_close(&web_server);
             return -1;
         }
         report_stats_maybe_print(&stats, false);
@@ -159,6 +185,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
     recovery_engine_flush(&engine);
     report_stats_maybe_print(&stats, true);
     recovery_engine_free(&engine);
+    web_server_close(&web_server);
     return 0;
 }
 
@@ -196,7 +223,9 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    result = run_loop(inputs, &output, &options.recovery_config) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    result = run_loop(inputs, &output, &options.recovery_config, options.http_port) == 0
+                 ? EXIT_SUCCESS
+                 : EXIT_FAILURE;
 
     output_udp_close(&output);
     input_udp_close(&inputs[1]);
