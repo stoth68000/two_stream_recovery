@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+_Static_assert(OUTPUT_UDP_PAYLOAD_BYTES == 1316, "UDP output payload must be 1316 bytes");
+
 int output_udp_parse_url(const char *url, char *host, size_t host_size, uint16_t *port)
 {
     const char *prefix = "udp://";
@@ -84,16 +86,19 @@ int output_udp_open(output_udp_t *output, const char *url)
 
 int output_udp_flush(output_udp_t *output)
 {
-    size_t bytes = output->pending_packets * 188;
     ssize_t sent;
 
     if (output->pending_packets == 0) {
         return 0;
     }
+    if (output->pending_packets != OUTPUT_TS_PACKETS_PER_DATAGRAM) {
+        output->pending_packets = 0;
+        return 0;
+    }
 
-    sent = sendto(output->fd, output->pending, bytes, 0,
+    sent = sendto(output->fd, output->pending, OUTPUT_UDP_PAYLOAD_BYTES, 0,
                   (struct sockaddr *)output->addr_storage, output->addr_len);
-    if (sent < 0 || (size_t)sent != bytes) {
+    if (sent < 0 || (size_t)sent != OUTPUT_UDP_PAYLOAD_BYTES) {
         perror("sendto");
         return -1;
     }
@@ -102,9 +107,13 @@ int output_udp_flush(output_udp_t *output)
     return 0;
 }
 
-int output_udp_send_ts_packet(output_udp_t *output, const uint8_t packet[188])
+int output_udp_send_ts_packet(output_udp_t *output, const uint8_t packet[TS_PACKET_SIZE])
 {
-    memcpy(output->pending + (output->pending_packets * 188), packet, 188);
+    if (output->pending_packets >= OUTPUT_TS_PACKETS_PER_DATAGRAM) {
+        return -1;
+    }
+
+    memcpy(output->pending + (output->pending_packets * TS_PACKET_SIZE), packet, TS_PACKET_SIZE);
     output->pending_packets++;
 
     if (output->pending_packets == OUTPUT_TS_PACKETS_PER_DATAGRAM) {

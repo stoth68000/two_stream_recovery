@@ -303,6 +303,8 @@ static void test_output_udp_pending_batch(void)
         assert(output_udp_send_ts_packet(&output, packet) == 0);
         assert(output.pending_packets == i + 1);
     }
+    assert(output_udp_flush(&output) == 0);
+    assert(output.pending_packets == 0);
 
     output_udp_close(&output);
     assert(output.fd == -1);

@@ -1326,14 +1326,8 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 
 int recovery_engine_flush(recovery_engine_t *engine)
 {
-    uint64_t packets_before = engine->stats->output_packets;
-
     if (recovery_engine_drain(engine, true) != 0) {
         return -1;
-    }
-    if (engine->stats->output_packets != packets_before &&
-        engine->stats->output_packets % OUTPUT_TS_PACKETS_PER_DATAGRAM != 0) {
-        report_stats_observe_output_datagram(engine->stats, true);
     }
     return packet_sink_flush(engine->sink);
 }
