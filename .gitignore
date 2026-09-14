@@ -4,3 +4,4 @@ tests/test_recovery
 tests/soak_replay
 1280x720p5994-avc-dwts-2xac3-20mb-5min.ts
 .*.swp
+.DS_Store

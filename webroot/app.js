@@ -1,5 +1,16 @@
 const numberFormat = new Intl.NumberFormat();
 
+const recoveryHelp = {
+  "Content packets": "Recovered real video, audio, or table packets from the backup input. Higher means the tool repaired more primary-stream loss. Perfect is 0 during a clean run, but this should increase when you intentionally drop real stream packets. Poor is primary loss with this staying flat, or this climbing while Output becomes degraded.",
+  "Null packets": "Recovered filler packets. These keep the transport stream shape steady but usually do not carry program content. Perfect is 0 during a clean run. Higher is expected when you drop null packets; poor only if Output becomes degraded or unrecoverable loss rises.",
+  "Bursts": "Number of recovery events where several packets were repaired together. Perfect is 0 during a clean run. It should increment when you create a burst loss. High values mean the primary input is having repeated outages.",
+  "Exact CC gaps": "Times the tool saw a clear continuity-counter jump and knew packets were missing. Perfect is 0. It should increment when primary packet loss is visible. High values mean frequent primary stream damage.",
+  "Secondary loss events": "Times the backup input appeared to be missing packets while primary had them. Perfect is 0. Higher means the backup stream is less reliable and may not be available when primary needs repair.",
+  "Missing packets": "Estimated packet count missing from the backup input. Perfect is 0. Higher is poor because it means the backup copy has holes and may not be able to repair primary loss.",
+  "Missing anchors": "Times the tool could not find a matching backup packet to line up recovery confidently. Perfect is 0. A few can happen while streams settle; high or fast-rising values mean the inputs are hard to match or too damaged.",
+  "Delay overflows": "Times the primary delay buffer filled before packets could be safely processed. Perfect is 0. Any increase is poor because it means the configured delay or history is too small for the live stream conditions."
+};
+
 function value(path, data, fallback = 0) {
   return path.reduce((current, key) => current && current[key] !== undefined ? current[key] : fallback, data);
 }
@@ -38,7 +49,10 @@ function renderStreamRow(name, health, cells) {
 
 function renderDefinitionList(id, rows) {
   const node = document.getElementById(id);
-  node.innerHTML = rows.map(([label, val]) => `<dt>${label}</dt><dd>${val}</dd>`).join("");
+  node.innerHTML = rows.map(([label, val, help]) => {
+    const helpAttr = help ? ` class="has-help" tabindex="0" data-help="${help}"` : "";
+    return `<dt${helpAttr}>${label}</dt><dd>${val}</dd>`;
+  }).join("");
 }
 
 function render(data) {
@@ -81,14 +95,14 @@ function render(data) {
   document.getElementById("streams").innerHTML = streamRows.join("");
 
   renderDefinitionList("recovery", [
-    ["Content packets", fmt(data.recovered_content_packets)],
-    ["Null packets", fmt(data.recovered_null_packets)],
-    ["Bursts", fmt(data.recovered_content_bursts)],
-    ["Exact CC gaps", fmt(data.recovery_exact_cc_gap)],
-    ["Secondary loss events", fmt(data.secondary_loss_events)],
-    ["Missing packets", fmt(data.secondary_missing_packets)],
-    ["Missing anchors", fmt(data.secondary_missing_anchors)],
-    ["Delay overflows", fmt(data.primary_delay_overflows)]
+    ["Content packets", fmt(data.recovered_content_packets), recoveryHelp["Content packets"]],
+    ["Null packets", fmt(data.recovered_null_packets), recoveryHelp["Null packets"]],
+    ["Bursts", fmt(data.recovered_content_bursts), recoveryHelp.Bursts],
+    ["Exact CC gaps", fmt(data.recovery_exact_cc_gap), recoveryHelp["Exact CC gaps"]],
+    ["Secondary loss events", fmt(data.secondary_loss_events), recoveryHelp["Secondary loss events"]],
+    ["Missing packets", fmt(data.secondary_missing_packets), recoveryHelp["Missing packets"]],
+    ["Missing anchors", fmt(data.secondary_missing_anchors), recoveryHelp["Missing anchors"]],
+    ["Delay overflows", fmt(data.primary_delay_overflows), recoveryHelp["Delay overflows"]]
   ]);
 
   renderDefinitionList("latency", [

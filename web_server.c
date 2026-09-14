@@ -13,7 +13,7 @@
 
 #define HTTP_REQUEST_SIZE 2048
 #define HTTP_RESPONSE_SIZE 16384
-#define HTTP_FILE_SIZE 65536
+#define HTTP_FILE_CHUNK_SIZE 16384
 
 static const char *content_type_for_path(const char *path)
 {
@@ -31,11 +31,50 @@ static const char *content_type_for_path(const char *path)
     if (strcmp(dot, ".js") == 0) {
         return "application/javascript; charset=utf-8";
     }
+    if (strcmp(dot, ".png") == 0) {
+        return "image/png";
+    }
     return "application/octet-stream";
 }
 
-static void send_response(int client_fd, int status, const char *reason,
-                          const char *content_type, const char *body, size_t body_size)
+static bool send_all(int client_fd, const void *buffer, size_t bytes)
+{
+    const uint8_t *cursor = (const uint8_t *)buffer;
+
+    while (bytes > 0) {
+        ssize_t sent = send(client_fd, cursor, bytes, 0);
+
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            fd_set write_fds;
+            struct timeval timeout;
+            int ready;
+
+            FD_ZERO(&write_fds);
+            FD_SET(client_fd, &write_fds);
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+
+            ready = select(client_fd + 1, NULL, &write_fds, NULL, &timeout);
+            if (ready > 0 && FD_ISSET(client_fd, &write_fds)) {
+                continue;
+            }
+            return false;
+        }
+        if (sent <= 0) {
+            return false;
+        }
+        cursor += sent;
+        bytes -= (size_t)sent;
+    }
+
+    return true;
+}
+
+static bool send_response_header(int client_fd, int status, const char *reason,
+                                 const char *content_type, size_t body_size)
 {
     char header[512];
     int header_size;
@@ -48,11 +87,17 @@ static void send_response(int client_fd, int status, const char *reason,
                            "Content-Length: %zu\r\n"
                            "\r\n",
                            status, reason, content_type, body_size);
-    if (header_size > 0) {
-        (void)send(client_fd, header, (size_t)header_size, 0);
+    return header_size > 0 && send_all(client_fd, header, (size_t)header_size);
+}
+
+static void send_response(int client_fd, int status, const char *reason,
+                          const char *content_type, const char *body, size_t body_size)
+{
+    if (!send_response_header(client_fd, status, reason, content_type, body_size)) {
+        return;
     }
     if (body_size > 0) {
-        (void)send(client_fd, body, body_size, 0);
+        (void)send_all(client_fd, body, body_size);
     }
 }
 
@@ -149,7 +194,7 @@ static void handle_api_stats(int client_fd, report_stats_t *stats)
 static void handle_static_file(web_server_t *server, int client_fd, const char *url_path)
 {
     char path[512];
-    char body[HTTP_FILE_SIZE];
+    char body[HTTP_FILE_CHUNK_SIZE];
     FILE *file;
     size_t bytes;
     struct stat st;
@@ -170,8 +215,8 @@ static void handle_static_file(web_server_t *server, int client_fd, const char *
         send_error(client_fd, 404, "not found");
         return;
     }
-    if (st.st_size < 0 || st.st_size > HTTP_FILE_SIZE) {
-        send_error(client_fd, 413, "file too large");
+    if (st.st_size < 0) {
+        send_error(client_fd, 500, "bad file size");
         return;
     }
 
@@ -180,10 +225,16 @@ static void handle_static_file(web_server_t *server, int client_fd, const char *
         send_error(client_fd, 404, "not found");
         return;
     }
-    bytes = fread(body, 1, sizeof(body), file);
+    if (!send_response_header(client_fd, 200, "OK", content_type_for_path(path), (size_t)st.st_size)) {
+        fclose(file);
+        return;
+    }
+    while ((bytes = fread(body, 1, sizeof(body), file)) > 0) {
+        if (!send_all(client_fd, body, bytes)) {
+            break;
+        }
+    }
     fclose(file);
-
-    send_response(client_fd, 200, "OK", content_type_for_path(path), body, bytes);
 }
 
 static void handle_client(web_server_t *server, int client_fd, report_stats_t *stats)

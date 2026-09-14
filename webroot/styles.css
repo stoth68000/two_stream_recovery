@@ -39,6 +39,67 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.app-icon-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+}
+
+.app-icon-wrap:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.app-icon-wrap:hover::after,
+.app-icon-wrap:focus::after {
+  position: absolute;
+  z-index: 30;
+  left: 0;
+  top: calc(100% + 12px);
+  width: 168px;
+  height: 168px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background:
+    url("/app-icon.png") center / contain no-repeat,
+    #0f151b;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.48);
+  content: "";
+}
+
+.app-icon-wrap:hover::before,
+.app-icon-wrap:focus::before {
+  position: absolute;
+  z-index: 31;
+  left: 17px;
+  top: calc(100% + 7px);
+  width: 10px;
+  height: 10px;
+  border-left: 1px solid var(--line);
+  border-top: 1px solid var(--line);
+  background: #0f151b;
+  content: "";
+  transform: rotate(45deg);
+}
+
+.app-icon {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+}
+
 h1,
 h2,
 p {
@@ -198,6 +259,54 @@ dd {
   font-variant-numeric: tabular-nums;
 }
 
+.has-help {
+  position: relative;
+  cursor: help;
+  text-decoration: underline dotted rgba(146, 161, 179, 0.65);
+  text-underline-offset: 3px;
+}
+
+.has-help:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.has-help:hover::after,
+.has-help:focus::after {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  bottom: calc(100% + 9px);
+  width: min(360px, calc(100vw - 44px));
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0f151b;
+  color: var(--text);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+  content: attr(data-help);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+  white-space: normal;
+}
+
+.has-help:hover::before,
+.has-help:focus::before {
+  position: absolute;
+  z-index: 21;
+  left: 14px;
+  bottom: calc(100% + 3px);
+  width: 10px;
+  height: 10px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #0f151b;
+  content: "";
+  transform: rotate(45deg);
+}
+
 @media (max-width: 900px) {
   .topbar {
     align-items: flex-start;
@@ -214,6 +323,23 @@ dd {
   .shell {
     width: min(100% - 20px, 1400px);
     padding-top: 16px;
+  }
+
+  .app-icon-wrap {
+    width: 38px;
+    height: 38px;
+    flex-basis: 38px;
+  }
+
+  .app-icon-wrap:hover::after,
+  .app-icon-wrap:focus::after {
+    width: 132px;
+    height: 132px;
+  }
+
+  .app-icon {
+    width: 38px;
+    height: 38px;
   }
 
   .summary-grid,
