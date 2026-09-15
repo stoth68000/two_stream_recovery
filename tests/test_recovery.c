@@ -580,10 +580,113 @@ static void test_report_stats_health_recovers_after_quiet_window(void)
     stats.packets_received[0] += 1000;
     stats.packets_received[1] += 1000;
     stats.output_packets += 1000;
+    stats.last_health_update_ns =
+        report_stats_now_ns() - REPORT_STATS_HEALTH_INTERVAL_NS - 1U;
 
     assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
     assert(strstr(json, "\"health\":[\"healthy\",\"healthy\"]") != NULL);
     assert(strstr(json, "\"output_health\":\"healthy\"") != NULL);
+}
+
+static void test_report_stats_marks_input_offline_after_quiet_stop(void)
+{
+    report_stats_t stats;
+    char json[8192];
+    uint64_t now_ns;
+
+    report_stats_init(&stats);
+    stats.packets_received[0] = 1000;
+    stats.packets_received[1] = 1000;
+    stats.output_packets = 1000;
+
+    now_ns = report_stats_now_ns();
+    assert(now_ns != 0);
+    stats.last_packet_ns[0] = now_ns - REPORT_STATS_OFFLINE_NS - 1U;
+    stats.last_packet_ns[1] = now_ns;
+    stats.last_health_update_ns = now_ns - REPORT_STATS_HEALTH_INTERVAL_NS - 1U;
+
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"health\":[\"offline\",\"healthy\"]") != NULL);
+}
+
+static void test_report_stats_health_updates_only_every_five_seconds(void)
+{
+    report_stats_t stats;
+    char json[8192];
+    uint64_t now_ns;
+
+    report_stats_init(&stats);
+    stats.packets_received[0] = 1000;
+    stats.packets_received[1] = 1000;
+    stats.output_packets = 1000;
+
+    now_ns = report_stats_now_ns();
+    assert(now_ns != 0);
+    stats.last_packet_ns[0] = now_ns - REPORT_STATS_OFFLINE_NS - 1U;
+    stats.last_packet_ns[1] = now_ns;
+    stats.last_health_update_ns = now_ns - REPORT_STATS_HEALTH_INTERVAL_NS + 1000000ULL;
+    stats.stream_health[0] = STREAM_HEALTH_HEALTHY;
+    stats.stream_health[1] = STREAM_HEALTH_HEALTHY;
+
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"health\":[\"healthy\",\"healthy\"]") != NULL);
+
+    stats.last_health_update_ns = now_ns - REPORT_STATS_HEALTH_INTERVAL_NS - 1U;
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"health\":[\"offline\",\"healthy\"]") != NULL);
+}
+
+static void test_report_stats_offline_return_resets_input_continuity(void)
+{
+    report_stats_t stats;
+    uint8_t packet[TS_PACKET_SIZE];
+    ts_packet_info_t info;
+    uint64_t now_ns;
+
+    report_stats_init(&stats);
+
+    make_packet(packet, 0x120, 0, 0x40);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 0, &info);
+    assert(stats.continuity_errors[0] == 0);
+
+    now_ns = report_stats_now_ns();
+    assert(now_ns != 0);
+    stats.last_packet_ns[0] = now_ns - REPORT_STATS_OFFLINE_NS - 1U;
+
+    make_packet(packet, 0x120, 7, 0x41);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 0, &info);
+    assert(stats.continuity_errors[0] == 0);
+
+    make_packet(packet, 0x120, 9, 0x42);
+    assert(ts_packet_parse(packet, &info));
+    report_stats_observe_packet(&stats, 0, &info);
+    assert(stats.continuity_errors[0] == 1);
+}
+
+static void test_report_stats_delay_overflow_does_not_poison_health(void)
+{
+    report_stats_t stats;
+    char json[8192];
+    uint64_t now_ns;
+
+    report_stats_init(&stats);
+    stats.packets_received[0] = 1000;
+    stats.packets_received[1] = 1000;
+    stats.output_packets = 1000;
+    stats.primary_delay_overflows = 1000;
+
+    now_ns = report_stats_now_ns();
+    assert(now_ns != 0);
+    stats.last_packet_ns[0] = now_ns;
+    stats.last_packet_ns[1] = now_ns;
+    stats.last_health_update_ns = now_ns - REPORT_STATS_HEALTH_INTERVAL_NS - 1U;
+
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"health\":[\"healthy\",\"healthy\"]") != NULL);
+    assert(strstr(json, "\"output_health\":\"healthy\"") != NULL);
+    assert(strstr(json, "\"primary_delay_overflows\":1000") != NULL);
 }
 
 static void test_primary_pass_through(void)
@@ -2543,6 +2646,10 @@ int main(void)
     test_ts_packet_parse_edges();
     test_report_stats_observe_edges();
     test_report_stats_health_recovers_after_quiet_window();
+    test_report_stats_marks_input_offline_after_quiet_stop();
+    test_report_stats_health_updates_only_every_five_seconds();
+    test_report_stats_offline_return_resets_input_continuity();
+    test_report_stats_delay_overflow_does_not_poison_health();
     test_primary_pass_through();
     test_clean_dual_input_baseline_no_recovery();
     test_repeated_null_packets_do_not_create_anchor_ambiguity();

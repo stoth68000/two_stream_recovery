@@ -19,8 +19,11 @@ void report_stats_init(report_stats_t *stats)
     memset(stats, 0, sizeof(*stats));
     stats->last_report_ns = report_stats_now_ns();
     stats->last_sample_ns = stats->last_report_ns;
+    stats->last_health_update_ns = 0;
     stats->active_output_stream_id = 0;
     stats->observed_secondary_latency_min_ns = 0.0;
+    stats->last_packet_ns[0] = stats->last_report_ns;
+    stats->last_packet_ns[1] = stats->last_report_ns;
     stats->stream_health[0] = STREAM_HEALTH_HEALTHY;
     stats->stream_health[1] = STREAM_HEALTH_HEALTHY;
     stats->output_health = STREAM_HEALTH_HEALTHY;
@@ -38,15 +41,29 @@ void report_stats_observe_datagram(report_stats_t *stats, int stream_id, size_t 
     }
 }
 
+static void reset_stream_continuity(report_stats_t *stats, int stream_id)
+{
+    memset(stats->has_continuity_counter[stream_id], 0,
+           sizeof(stats->has_continuity_counter[stream_id]));
+}
+
 void report_stats_observe_packet(report_stats_t *stats, int stream_id, const ts_packet_info_t *info)
 {
     uint16_t pid = info->pid;
+    uint64_t now_ns;
 
     if (stream_id < 0 || stream_id >= REPORT_STATS_STREAMS) {
         return;
     }
 
+    now_ns = report_stats_now_ns();
+    if (now_ns != 0 && stats->last_packet_ns[stream_id] != 0 &&
+        now_ns - stats->last_packet_ns[stream_id] >= REPORT_STATS_OFFLINE_NS) {
+        reset_stream_continuity(stats, stream_id);
+    }
+
     stats->packets_received[stream_id]++;
+    stats->last_packet_ns[stream_id] = now_ns;
     stats->per_pid_packets[stream_id][pid]++;
 
     if (info->transport_error) {
@@ -181,6 +198,8 @@ static const char *stream_health_name(stream_health_t health)
         return "lossy";
     case STREAM_HEALTH_UNTRUSTED:
         return "untrusted";
+    case STREAM_HEALTH_OFFLINE:
+        return "offline";
     }
 
     return "unknown";
@@ -264,8 +283,6 @@ static uint64_t stream_problem_delta(const report_stats_t *stats,
                                    : stats->recovered_packets - sample->recovered_packets;
         problems += sample == NULL ? stats->unrecoverable_loss
                                    : stats->unrecoverable_loss - sample->unrecoverable_loss;
-        problems += sample == NULL ? stats->primary_delay_overflows
-                                   : stats->primary_delay_overflows - sample->primary_delay_overflows;
         problems += sample == NULL ? stats->primary_delay_insufficient
                                    : stats->primary_delay_insufficient - sample->primary_delay_insufficient;
         problems += sample == NULL ? stats->recovery_exact_cc_gap
@@ -294,13 +311,11 @@ static uint64_t output_problem_delta(const report_stats_t *stats,
     if (sample == NULL) {
         problems = stats->output_continuity_errors +
                    stats->output_duplicate_counters +
-                   stats->unrecoverable_loss +
-                   stats->primary_delay_overflows;
+                   stats->unrecoverable_loss;
     } else {
         problems = stats->output_continuity_errors - sample->output_continuity_errors;
         problems += stats->output_duplicate_counters - sample->output_duplicate_counters;
         problems += stats->unrecoverable_loss - sample->unrecoverable_loss;
-        problems += stats->primary_delay_overflows - sample->primary_delay_overflows;
     }
     return problems;
 }
@@ -327,7 +342,14 @@ static void update_stream_health(report_stats_t *stats)
 {
     const report_stats_sample_t *window_sample = oldest_rolling_sample(stats);
     const report_stats_sample_t *quiet_sample = rolling_sample_ago(stats, REPORT_STATS_QUIET_SECONDS);
+    uint64_t now_ns = report_stats_now_ns();
     int stream_id;
+
+    if (now_ns != 0 && stats->last_health_update_ns != 0 &&
+        now_ns - stats->last_health_update_ns < REPORT_STATS_HEALTH_INTERVAL_NS) {
+        return;
+    }
+    stats->last_health_update_ns = now_ns;
 
     for (stream_id = 0; stream_id < REPORT_STATS_STREAMS; stream_id++) {
         uint64_t packets = window_sample == NULL
@@ -337,8 +359,13 @@ static void update_stream_health(report_stats_t *stats)
         uint64_t problems = stream_problem_delta(stats, window_sample, stream_id);
         uint64_t quiet_problems = stream_problem_delta(stats, quiet_sample, stream_id);
 
-        stats->stream_health[stream_id] =
-            health_from_recent(packets, problems, quiet_problems);
+        if (now_ns != 0 && stats->last_packet_ns[stream_id] != 0 &&
+            now_ns - stats->last_packet_ns[stream_id] >= REPORT_STATS_OFFLINE_NS) {
+            stats->stream_health[stream_id] = STREAM_HEALTH_OFFLINE;
+        } else {
+            stats->stream_health[stream_id] =
+                health_from_recent(packets, problems, quiet_problems);
+        }
     }
 
     stats->output_health =

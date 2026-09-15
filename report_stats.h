@@ -12,12 +12,15 @@
 #define REPORT_STATS_PIDS 8192
 #define REPORT_STATS_ROLLING_SECONDS 60
 #define REPORT_STATS_QUIET_SECONDS 30
+#define REPORT_STATS_HEALTH_INTERVAL_NS 5000000000ULL
+#define REPORT_STATS_OFFLINE_NS 5000000000ULL
 
 typedef enum stream_health {
     STREAM_HEALTH_HEALTHY = 0,
     STREAM_HEALTH_DEGRADED,
     STREAM_HEALTH_LOSSY,
-    STREAM_HEALTH_UNTRUSTED
+    STREAM_HEALTH_UNTRUSTED,
+    STREAM_HEALTH_OFFLINE
 } stream_health_t;
 
 typedef enum recovery_reject_reason {
@@ -108,6 +111,8 @@ typedef struct report_stats {
     time_t last_recovery_event_time;
     uint64_t last_report_ns;
     uint64_t last_sample_ns;
+    uint64_t last_health_update_ns;
+    uint64_t last_packet_ns[REPORT_STATS_STREAMS];
     report_stats_sample_t rolling_samples[REPORT_STATS_ROLLING_SECONDS];
     size_t rolling_index;
     size_t rolling_count;
