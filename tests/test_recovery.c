@@ -724,6 +724,41 @@ static void test_primary_return_switches_back_after_holdoff(void)
     recovery_engine_free(&engine);
 }
 
+static void test_primary_switchback_guard_survives_null_until_informative_fit(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+
+    config.primary_delay_ns = 0;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    make_packet(packet, 0x130, 0, 0x40);
+    push_packet(&engine, &stats, 0, packet);
+
+    engine.primary_switchback_guard = true;
+    engine.primary_switchback_guard_informative = 1;
+
+    make_null_packet(packet, 0x41);
+    push_packet(&engine, &stats, 0, packet);
+
+    make_packet(packet, 0x130, 2, 0x42);
+    push_packet(&engine, &stats, 0, packet);
+
+    make_packet(packet, 0x130, 1, 0x43);
+    push_packet(&engine, &stats, 0, packet);
+
+    assert(stats.output_continuity_errors == 0);
+    assert(stats.output_duplicate_counters == 0);
+    assert(capture.packet_count == 3);
+
+    recovery_engine_free(&engine);
+}
+
 static void test_secondary_outage_keeps_primary_output(void)
 {
     recovery_engine_config_t config = recovery_engine_default_config();
@@ -1634,6 +1669,7 @@ int main(void)
     test_burst_recovery();
     test_primary_outage_fails_over_to_secondary();
     test_primary_return_switches_back_after_holdoff();
+    test_primary_switchback_guard_survives_null_until_informative_fit();
     test_secondary_outage_keeps_primary_output();
     test_counter_fallback_recovery_without_anchor();
     test_stream_time_range_recovery();

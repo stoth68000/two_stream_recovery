@@ -777,8 +777,11 @@ static void set_active_output_stream(recovery_engine_t *engine, int stream_id)
     if (stream_id == 1) {
         engine->primary_return_start_ns = 0;
         engine->primary_switchback_guard = false;
+        engine->primary_switchback_guard_informative = 0;
     } else if (previous_stream_id == 1) {
         engine->primary_switchback_guard = true;
+        engine->primary_switchback_guard_informative =
+            FAILOVER_ALIGNMENT_MIN_INFORMATIVE_PACKETS;
     }
 }
 
@@ -1919,39 +1922,48 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
     while (engine->primary_queue.count > 0) {
         uint64_t now_ns = report_stats_now_ns();
         packet_record_t *record = primary_delay_queue_front(&engine->primary_queue);
-        packet_record_t *secondary_match;
+        packet_record_t *secondary_match = NULL;
         uint64_t recovered_before = engine->stats->recovered_packets;
 
         if (!force && now_ns - record->arrival_time_ns < engine->primary_queue.delay_ns) {
             break;
         }
 
-        if (recover_stream_gap_before_primary(engine, record) != 0) {
-            return -1;
-        }
-
-        secondary_match = find_secondary_match_for_primary(engine, record);
-        if (recover_nulls_before_primary(engine, record, secondary_match) != 0) {
-            return -1;
-        }
-
-        if (recover_pid_gap_before_primary(engine, record) != 0) {
-            return -1;
-        }
-
-        if (recover_content_burst_before_primary(engine, record, secondary_match) != 0) {
-            return -1;
-        }
-
-        diagnose_secondary_loss_before_primary(engine, record, secondary_match);
-
-        if (engine->stats->recovered_packets > recovered_before &&
-            !record_fits_next_output(engine, record)) {
-            int bridge_recovered = recover_secondary_bridge_to_primary(
-                engine, record, RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS);
-
-            if (bridge_recovered < 0) {
+        if (engine->primary_switchback_guard) {
+            if (!record_fits_next_output(engine, record)) {
+                report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
+                engine->stats->unrecoverable_loss++;
+                primary_delay_queue_pop(&engine->primary_queue);
+                continue;
+            }
+        } else {
+            if (recover_stream_gap_before_primary(engine, record) != 0) {
                 return -1;
+            }
+
+            secondary_match = find_secondary_match_for_primary(engine, record);
+            if (recover_nulls_before_primary(engine, record, secondary_match) != 0) {
+                return -1;
+            }
+
+            if (recover_pid_gap_before_primary(engine, record) != 0) {
+                return -1;
+            }
+
+            if (recover_content_burst_before_primary(engine, record, secondary_match) != 0) {
+                return -1;
+            }
+
+            diagnose_secondary_loss_before_primary(engine, record, secondary_match);
+
+            if (engine->stats->recovered_packets > recovered_before &&
+                !record_fits_next_output(engine, record)) {
+                int bridge_recovered = recover_secondary_bridge_to_primary(
+                    engine, record, RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS);
+
+                if (bridge_recovered < 0) {
+                    return -1;
+                }
             }
         }
 
@@ -1968,7 +1980,13 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         if (output_record(engine, record) != 0) {
             return -1;
         }
-        engine->primary_switchback_guard = false;
+        if (engine->primary_switchback_guard && record_is_informative(record) &&
+            engine->primary_switchback_guard_informative > 0) {
+            engine->primary_switchback_guard_informative--;
+            if (engine->primary_switchback_guard_informative == 0) {
+                engine->primary_switchback_guard = false;
+            }
+        }
         engine->primary_gap.valid = true;
         engine->primary_gap.arrival_time_ns = record->arrival_time_ns;
         engine->primary_gap.continuity_errors = record->stream_continuity_errors;

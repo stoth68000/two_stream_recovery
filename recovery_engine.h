@@ -136,6 +136,7 @@ typedef struct recovery_engine {
     int active_output_stream_id;
     uint64_t primary_return_start_ns;
     bool primary_switchback_guard;
+    uint32_t primary_switchback_guard_informative;
     alignment_state_t alignment;
     primary_anchor_t last_primary_anchor;
     primary_gap_state_t primary_gap;
