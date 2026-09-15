@@ -23,19 +23,56 @@ static uint64_t hash_packet(const uint8_t packet[TS_PACKET_SIZE])
     return hash;
 }
 
-static void decision_log(const char *decision, const char *reason,
-                         uint64_t primary_index, uint64_t secondary_index,
-                         uint64_t packets)
+static void format_packet_timestamp(const packet_record_t *record, char *buffer, size_t buffer_size)
 {
-    char timestamp[64];
-    time_t now = time(NULL);
+    time_t seconds = record->arrival_time.tv_sec;
     struct tm tm_now;
 
-    localtime_r(&now, &tm_now);
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S %z", &tm_now);
-    printf("%s decision=%s reason=%s primary_index=%" PRIu64
-           " secondary_index=%" PRIu64 " packets=%" PRIu64 "\n",
-           timestamp, decision, reason, primary_index, secondary_index, packets);
+    localtime_r(&seconds, &tm_now);
+    strftime(buffer, buffer_size, "%Y-%m-%dT%H:%M:%S%z", &tm_now);
+}
+
+static const char *yes_no(bool value)
+{
+    return value ? "yes" : "no";
+}
+
+static void recovery_decision_log(const recovery_engine_t *engine,
+                                  const packet_record_t *primary,
+                                  uint8_t previous_cc,
+                                  bool has_previous_cc,
+                                  uint64_t missing_count,
+                                  bool has_missing_count,
+                                  bool candidate_available,
+                                  bool before_anchor,
+                                  bool after_anchor,
+                                  const char *decision,
+                                  const char *reason)
+{
+    char timestamp[64];
+
+    format_packet_timestamp(primary, timestamp, sizeof(timestamp));
+    printf("recovery_decision ts=%s.%06ld hash=%016" PRIx64
+           " idx=%" PRIu64 " pid=0x%04x cc=",
+           timestamp, (long)primary->arrival_time.tv_usec, primary->hash,
+           primary->stream_index, primary->pid);
+    if (has_previous_cc) {
+        printf("%u->%u", previous_cc, primary->continuity_counter);
+    } else {
+        printf("unknown->%u", primary->continuity_counter);
+    }
+    if (has_missing_count) {
+        printf(" missing=%" PRIu64, missing_count);
+    } else {
+        printf(" missing=unknown");
+    }
+    printf(" align=%u candidate=%s before=%s after=%s decision=%s",
+           engine->alignment.confidence, yes_no(candidate_available),
+           yes_no(before_anchor), yes_no(after_anchor), decision);
+    if (reason != NULL && reason[0] != '\0') {
+        printf(" reason=%s", reason);
+    }
+    printf("\n");
     fflush(stdout);
 }
 
@@ -209,6 +246,40 @@ static bool record_fits_output_states(const output_pid_state_t states[REPORT_STA
 static bool record_fits_next_output(recovery_engine_t *engine, const packet_record_t *record)
 {
     return record_fits_output_states(engine->output_pid_state, record);
+}
+
+static bool previous_output_cc_for_record(const recovery_engine_t *engine,
+                                          const packet_record_t *record,
+                                          uint8_t *previous_cc)
+{
+    const output_pid_state_t *state;
+
+    if (record->is_null || record->pid >= REPORT_STATS_PIDS) {
+        return false;
+    }
+    state = &engine->output_pid_state[record->pid];
+    if (!state->valid) {
+        return false;
+    }
+    *previous_cc = state->continuity_counter;
+    return true;
+}
+
+static bool infer_missing_from_cc(uint8_t previous_cc, const packet_record_t *record,
+                                  uint64_t *missing_count)
+{
+    uint8_t delta;
+
+    if (!record->has_payload || record->is_null) {
+        return false;
+    }
+
+    delta = (uint8_t)((record->continuity_counter + 16U - previous_cc) & 0x0fU);
+    if (delta == 0) {
+        return false;
+    }
+    *missing_count = (uint64_t)(delta - 1U);
+    return true;
 }
 
 static void observe_output_states(output_pid_state_t states[REPORT_STATS_PIDS],
@@ -508,8 +579,12 @@ static bool detect_stage1_anchored_primary_gap(recovery_engine_t *engine,
     uint64_t primary_between;
     uint64_t secondary_between;
     uint64_t missing_packets;
+    uint64_t cc_missing_count = 0;
     uint64_t index;
     bool has_content = false;
+    bool has_previous_cc;
+    bool has_cc_missing_count = false;
+    uint8_t previous_cc = 0;
     output_pid_state_t states[REPORT_STATS_PIDS];
 
     if (!engine->last_primary_anchor.valid || secondary_match == NULL) {
@@ -532,15 +607,21 @@ static bool detect_stage1_anchored_primary_gap(recovery_engine_t *engine,
     if (record_fits_next_output(engine, primary)) {
         return false;
     }
+    has_previous_cc = previous_output_cc_for_record(engine, primary, &previous_cc);
+    if (has_previous_cc) {
+        has_cc_missing_count = infer_missing_from_cc(previous_cc, primary, &cc_missing_count);
+    }
     if (primary_between != 0) {
-        decision_log("detect", "stage1-noncontiguous-primary-gap", primary->stream_index,
-                     secondary_match->stream_index, missing_packets);
+        recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                              missing_packets, true, true, true, true,
+                              "reject", "noncontiguous_primary_gap");
         return true;
     }
     if (missing_packets > engine->config.max_content_burst_packets ||
         missing_packets > RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS) {
-        decision_log("detect", "stage1-gap-too-large", primary->stream_index,
-                     secondary_match->stream_index, missing_packets);
+        recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                              missing_packets, true, true, true, true,
+                              "reject", "burst_too_large");
         return true;
     }
 
@@ -549,22 +630,53 @@ static bool detect_stage1_anchored_primary_gap(recovery_engine_t *engine,
         uint64_t secondary_index = engine->last_primary_anchor.secondary_index + 1ULL + index;
         packet_record_t *candidate = packet_history_find_index(&engine->history[1], secondary_index);
 
-        if (candidate == NULL || candidate->transport_error ||
-            candidate->discontinuity_indicator ||
-            !record_fits_output_states(states, candidate)) {
-            return false;
+        if (candidate == NULL) {
+            recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                                  has_cc_missing_count ? cc_missing_count : missing_packets,
+                                  has_cc_missing_count || missing_packets > 0, false, true, true,
+                                  "reject", "missing_candidate");
+            return true;
+        }
+        if (candidate->transport_error) {
+            recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                                  missing_packets, true, true, true, true,
+                                  "reject", "secondary_tei");
+            return true;
+        }
+        if (candidate->discontinuity_indicator) {
+            recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                                  missing_packets, true, true, true, true,
+                                  "reject", "secondary_discontinuity");
+            return true;
+        }
+        if (!record_fits_output_states(states, candidate)) {
+            recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                                  missing_packets, true, true, true, true,
+                                  "reject", "secondary_wrong_counter");
+            return true;
         }
         if (!candidate->is_null) {
             has_content = true;
         }
         observe_output_states(states, candidate);
     }
-    if (!has_content || !record_fits_output_states(states, primary)) {
-        return false;
+    if (!has_content) {
+        recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                              missing_packets, true, true, true, true,
+                              "reject", "null_only_gap");
+        return true;
+    }
+    if (!record_fits_output_states(states, primary)) {
+        recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                              missing_packets, true, true, true, true,
+                              "reject", "after_anchor_wrong_counter");
+        return true;
     }
 
-    decision_log("detect", "stage1-anchored-primary-gap", primary->stream_index,
-                 secondary_match->stream_index, missing_packets);
+    recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                          missing_packets, true, true, true, true,
+                          missing_packets > 1 ? "recover_content_burst" : "recover_content",
+                          NULL);
     return true;
 }
 
@@ -717,6 +829,8 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
     while (engine->primary_queue.count > 0) {
         packet_record_t *primary = delay_queue_front(&engine->primary_queue);
         packet_record_t *secondary_match;
+        bool primary_fits;
+        bool logged_recovery_decision = false;
 
         if (primary == NULL) {
             break;
@@ -728,12 +842,27 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         }
 
         secondary_match = find_secondary_boundary_match(engine, primary);
-        if (stage1_has_anchored_primary_gap(engine, primary, secondary_match)) {
-            (void)detect_stage1_anchored_primary_gap(engine, primary, secondary_match);
+        primary_fits = record_fits_next_output(engine, primary);
+        if (!primary_fits && stage1_has_anchored_primary_gap(engine, primary, secondary_match)) {
+            logged_recovery_decision = detect_stage1_anchored_primary_gap(engine, primary,
+                                                                          secondary_match);
         }
-        if (!record_fits_next_output(engine, primary)) {
-            decision_log("detect", "stage0-primary-does-not-fit", primary->stream_index,
-                         secondary_match != NULL ? secondary_match->stream_index : 0, 0);
+        if (!primary_fits && !logged_recovery_decision) {
+            uint8_t previous_cc = 0;
+            uint64_t missing_count = 0;
+            bool has_previous_cc = previous_output_cc_for_record(engine, primary, &previous_cc);
+            bool has_missing_count = has_previous_cc &&
+                                     infer_missing_from_cc(previous_cc, primary, &missing_count);
+
+            recovery_decision_log(engine, primary, previous_cc, has_previous_cc,
+                                  missing_count, has_missing_count,
+                                  secondary_match != NULL,
+                                  engine->last_primary_anchor.valid,
+                                  secondary_match != NULL,
+                                  "reject",
+                                  engine->alignment.confidence < engine->config.min_alignment_confidence
+                                      ? "low_alignment"
+                                      : "missing_anchor_or_candidate");
         }
         if (output_record(engine, primary) != 0) {
             return -1;
