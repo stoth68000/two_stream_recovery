@@ -1602,6 +1602,146 @@ static void test_counter_fallback_recovery_without_anchor(void)
     recovery_engine_free(&engine);
 }
 
+static void make_live_equivalent_packet(uint8_t packet[TS_PACKET_SIZE],
+                                        uint8_t continuity_counters[3],
+                                        size_t sequence)
+{
+    static const uint16_t pids[7] = {
+        0x0310, 0x0311, TS_NULL_PID, 0x0310, 0x0312, TS_NULL_PID, 0x0311
+    };
+    uint16_t pid = pids[sequence % 7U];
+
+    if (pid == TS_NULL_PID) {
+        make_null_packet(packet, (uint8_t)(0x40 + sequence));
+    } else {
+        unsigned pid_index = pid == 0x0310 ? 0U : pid == 0x0311 ? 1U : 2U;
+
+        make_packet(packet, pid, continuity_counters[pid_index],
+                    (uint8_t)(0x40 + sequence));
+        continuity_counters[pid_index] = (uint8_t)((continuity_counters[pid_index] + 1U) & 0x0fU);
+    }
+    stamp_packet_unique(packet, 0x7d00, (uint16_t)sequence);
+}
+
+static void run_live_equivalent_datagram_loss(unsigned datagrams,
+                                              uint32_t max_burst,
+                                              bool expect_recovery)
+{
+    enum {
+        ANCHOR_PACKETS = 28,
+        WARMUP_PACKETS = 28,
+        TS_PER_DATAGRAM = 7,
+        MAX_GAP_PACKETS = 105
+    };
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t cc[3] = {0, 0, 0};
+    uint8_t missing[MAX_GAP_PACKETS][TS_PACKET_SIZE];
+    uint8_t primary_after[TS_PACKET_SIZE];
+    uint8_t secondary_after[TS_PACKET_SIZE];
+    unsigned gap_packets = datagrams * TS_PER_DATAGRAM;
+    unsigned prefix_packets = ANCHOR_PACKETS + WARMUP_PACKETS;
+    unsigned expected_content = 0;
+    unsigned expected_null = 0;
+    unsigned i;
+
+    assert(datagrams >= 1);
+    assert(gap_packets <= MAX_GAP_PACKETS);
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.config.max_content_burst_packets = max_burst;
+
+    for (i = 0; i < ANCHOR_PACKETS; i++) {
+        uint8_t packet[TS_PACKET_SIZE];
+
+        make_packet(packet, 0x030f, (uint8_t)(i & 0x0fU), (uint8_t)(0x20 + i));
+        stamp_packet_unique(packet, 0x7c00, (uint16_t)i);
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(engine.last_primary_anchor.valid);
+
+    for (i = 0; i < WARMUP_PACKETS; i++) {
+        uint8_t packet[TS_PACKET_SIZE];
+
+        make_live_equivalent_packet(packet, cc, i);
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(engine.last_primary_anchor.valid);
+
+    for (i = 0; i < gap_packets; i++) {
+        ts_packet_info_t info;
+
+        make_live_equivalent_packet(missing[i], cc, WARMUP_PACKETS + i);
+        assert(ts_packet_parse(missing[i], &info));
+        if (info.is_null) {
+            expected_null++;
+        } else {
+            expected_content++;
+        }
+        push_packet(&engine, &stats, 1, missing[i]);
+    }
+
+    make_live_equivalent_packet(primary_after, cc, WARMUP_PACKETS + gap_packets);
+    memcpy(secondary_after, primary_after, TS_PACKET_SIZE);
+    push_packet(&engine, &stats, 1, secondary_after);
+    push_packet(&engine, &stats, 0, primary_after);
+
+    assert(recovery_engine_flush(&engine) == 0);
+    if (expect_recovery) {
+        assert(capture.packet_count == prefix_packets + gap_packets + 1);
+        for (i = 0; i < gap_packets; i++) {
+            assert(memcmp(capture.packets[prefix_packets + i], missing[i],
+                          TS_PACKET_SIZE) == 0);
+        }
+        assert(memcmp(capture.packets[prefix_packets + gap_packets],
+                      primary_after, TS_PACKET_SIZE) == 0);
+        assert(stats.recovered_packets == gap_packets);
+        assert(stats.recovered_content_packets == expected_content);
+        assert(stats.recovered_null_packets == expected_null);
+        assert(stats.recovered_content_bursts == 1);
+        assert(stats.recovery_rejects[RECOVERY_REJECT_BURST_TOO_LARGE] == 0);
+        assert(stats.output_continuity_errors == 0);
+        assert(stats.unrecoverable_loss == 0);
+    } else {
+        assert(capture.packet_count == prefix_packets + 1);
+        assert(memcmp(capture.packets[prefix_packets], primary_after,
+                      TS_PACKET_SIZE) == 0);
+        assert(stats.recovered_packets == 0);
+        assert(stats.recovered_content_packets == 0);
+        assert(stats.recovered_null_packets == 0);
+        assert(stats.recovery_rejects[RECOVERY_REJECT_BURST_TOO_LARGE] == 1);
+        assert(stats.output_continuity_errors > 0);
+    }
+
+    recovery_engine_free(&engine);
+}
+
+static void test_live_equivalent_one_datagram_loss_recovers(void)
+{
+    run_live_equivalent_datagram_loss(1, 7, true);
+}
+
+static void test_live_equivalent_two_datagram_loss_recovers(void)
+{
+    run_live_equivalent_datagram_loss(2, 14, true);
+}
+
+static void test_live_equivalent_fifteen_datagram_loss_recovers_when_configured(void)
+{
+    run_live_equivalent_datagram_loss(15, 105, true);
+    run_live_equivalent_datagram_loss(15, 255, true);
+}
+
+static void test_live_equivalent_fifteen_datagram_loss_rejects_default_max(void)
+{
+    run_live_equivalent_datagram_loss(15, RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS, false);
+}
+
 static void test_stream_time_range_recovery(void)
 {
     enum {
@@ -2744,6 +2884,10 @@ int main(void)
     test_generated_content_recovery_sweep();
     test_mixed_pid_burst_recovery_with_null();
     test_mixed_pid_burst_rejects_counter_contradiction();
+    test_live_equivalent_one_datagram_loss_recovers();
+    test_live_equivalent_two_datagram_loss_recovers();
+    test_live_equivalent_fifteen_datagram_loss_recovers_when_configured();
+    test_live_equivalent_fifteen_datagram_loss_rejects_default_max();
     test_null_only_gap_recovered_separately();
     test_null_only_regions_do_not_establish_alignment();
     test_pid_specific_loss_does_not_log_mixed_rejects_for_nulls();

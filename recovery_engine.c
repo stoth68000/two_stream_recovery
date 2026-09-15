@@ -8,6 +8,7 @@
 
 #define OUTPUT_TS_PACKETS_PER_DATAGRAM 7U
 #define STAGE1_BOUNDARY_SEARCH_EXTRA 8U
+#define OVERSIZE_AFTER_ANCHOR_SCAN_PACKETS 255ULL
 #define WIDE_ALIGNMENT_PROBE_INTERVAL 512ULL
 #define RECOVERY_DECISION_NONE 0
 #define RECOVERY_DECISION_INSERTED 1
@@ -672,9 +673,16 @@ static void find_secondary_boundary_matches(recovery_engine_t *engine,
     }
 
     first_index = engine->last_primary_anchor.secondary_index + 1ULL;
-    last_index = first_index +
-                 (primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL) +
-                 (uint64_t)engine->config.max_content_burst_packets + 1ULL;
+    {
+        uint64_t oversize_scan = (uint64_t)engine->config.max_content_burst_packets + 1ULL;
+
+        if (oversize_scan < OVERSIZE_AFTER_ANCHOR_SCAN_PACKETS) {
+            oversize_scan = OVERSIZE_AFTER_ANCHOR_SCAN_PACKETS;
+        }
+        last_index = first_index +
+                     (primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL) +
+                     oversize_scan;
+    }
     collect_secondary_after_anchor_candidates_in_range(engine, primary, first_index,
                                                        last_index, candidates);
 }
