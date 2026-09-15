@@ -631,7 +631,7 @@ static void test_clean_dual_input_baseline_no_recovery(void)
     recovery_engine_free(&engine);
 }
 
-static void test_single_packet_gap_detection_only(void)
+static void test_exact_single_packet_content_recovery(void)
 {
     recovery_engine_t engine;
     report_stats_t stats;
@@ -655,13 +655,14 @@ static void test_single_packet_gap_detection_only(void)
     push_packet(&engine, &stats, 1, secondary_d);
 
     assert(recovery_engine_flush(&engine) == 0);
-    assert(capture.packet_count == 13);
-    assert(memcmp(capture.packets[12], primary_d, TS_PACKET_SIZE) == 0);
-    assert(memcmp(capture.packets[12], secondary_c, TS_PACKET_SIZE) != 0);
-    assert(stats.recovered_content_packets == 0);
-    assert(stats.recovered_packets == 0);
+    assert(capture.packet_count == 14);
+    assert(memcmp(capture.packets[12], secondary_c, TS_PACKET_SIZE) == 0);
+    assert(memcmp(capture.packets[13], primary_d, TS_PACKET_SIZE) == 0);
+    assert(stats.recovered_content_packets == 1);
+    assert(stats.recovered_null_packets == 0);
+    assert(stats.recovered_packets == 1);
     assert(stats.unrecoverable_loss == 0);
-    assert(stats.output_continuity_errors == 1);
+    assert(stats.output_continuity_errors == 0);
     recovery_engine_free(&engine);
 }
 
@@ -1948,7 +1949,7 @@ int main(void)
     test_report_stats_health_recovers_after_quiet_window();
     test_primary_pass_through();
     test_clean_dual_input_baseline_no_recovery();
-    test_single_packet_gap_detection_only();
+    test_exact_single_packet_content_recovery();
     test_burst_gap_detection_only();
     test_anchor_gap_detection_only_with_counter_wrap();
     printf("test_recovery: ok\n");
