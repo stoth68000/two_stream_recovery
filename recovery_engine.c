@@ -550,6 +550,59 @@ static packet_record_t *find_confirmed_matching_record_near(packet_history_t *se
     return NULL;
 }
 
+static uint32_t count_forward_exact_run(packet_history_t *primary_history,
+                                        packet_history_t *secondary_history,
+                                        const packet_record_t *primary,
+                                        const packet_record_t *secondary,
+                                        uint32_t max_count)
+{
+    uint32_t count = 0;
+
+    while (count < max_count) {
+        packet_record_t *next_primary =
+            packet_history_find_index(primary_history, primary->stream_index + count);
+        packet_record_t *next_secondary =
+            packet_history_find_index(secondary_history, secondary->stream_index + count);
+
+        if (next_primary == NULL || next_secondary == NULL ||
+            !records_exact_non_error_match(next_primary, next_secondary)) {
+            break;
+        }
+        count++;
+    }
+    return count;
+}
+
+static packet_record_t *find_best_forward_boundary_match(recovery_engine_t *engine,
+                                                         const packet_record_t *primary,
+                                                         uint64_t first_index,
+                                                         uint64_t last_index,
+                                                         packet_record_t **best_match,
+                                                         uint32_t *best_count)
+{
+    uint64_t index;
+
+    for (index = first_index; index <= last_index; index++) {
+        packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
+        uint32_t forward_count;
+
+        if (candidate == NULL || !records_exact_non_error_match(primary, candidate)) {
+            continue;
+        }
+        forward_count = count_forward_exact_run(&engine->history[0], &engine->history[1],
+                                                primary, candidate,
+                                                RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD);
+        if (forward_count >= RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
+            return candidate;
+        }
+        if (*best_match == NULL || forward_count > *best_count) {
+            *best_match = candidate;
+            *best_count = forward_count;
+        }
+    }
+    return NULL;
+}
+
 static void update_alignment(recovery_engine_t *engine, int stream_id, const packet_record_t *record)
 {
     packet_history_t *self = &engine->history[stream_id];
@@ -605,17 +658,17 @@ static packet_record_t *find_secondary_boundary_match(recovery_engine_t *engine,
 {
     uint64_t first_index;
     uint64_t last_index;
-    uint64_t index;
     int64_t expected_index;
     packet_record_t *match;
+    packet_record_t *best_match = NULL;
+    uint32_t best_count = 0;
 
     if (primary->transport_error || primary->discontinuity_indicator) {
         return NULL;
     }
     if (engine->alignment.has_alignment) {
         expected_index = (int64_t)primary->stream_index + engine->alignment.offset_packets;
-        match = find_matching_record_near(&engine->history[1], primary, expected_index,
-                                          STAGE1_BOUNDARY_SEARCH_EXTRA);
+        match = find_matching_record_near(&engine->history[1], primary, expected_index, 0);
         if (match != NULL) {
             return match;
         }
@@ -625,12 +678,10 @@ static packet_record_t *find_secondary_boundary_match(recovery_engine_t *engine,
                                        : 0ULL;
             uint64_t last_exact = (uint64_t)(expected_index + (int64_t)STAGE1_BOUNDARY_SEARCH_EXTRA);
 
-            for (index = first_exact; index <= last_exact; index++) {
-                packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
-
-                if (candidate != NULL && records_exact_non_error_match(primary, candidate)) {
-                    return candidate;
-                }
+            match = find_best_forward_boundary_match(engine, primary, first_exact, last_exact,
+                                                     &best_match, &best_count);
+            if (match != NULL) {
+                return match;
             }
         }
     }
@@ -643,15 +694,13 @@ static packet_record_t *find_secondary_boundary_match(recovery_engine_t *engine,
     last_index = first_index +
                  (primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL) +
                  (uint64_t)engine->config.max_content_burst_packets;
-    for (index = first_index; index <= last_index; index++) {
-        packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
-
-        if (candidate != NULL && records_exact_non_error_match(primary, candidate)) {
-            return candidate;
-        }
+    match = find_best_forward_boundary_match(engine, primary, first_index, last_index,
+                                             &best_match, &best_count);
+    if (match != NULL) {
+        return match;
     }
 
-    return NULL;
+    return best_match;
 }
 
 static int try_recover_exact_content_gap(recovery_engine_t *engine,
@@ -710,9 +759,6 @@ static int try_recover_exact_content_gap(recovery_engine_t *engine,
                             cc_missing_count, true, true, true, true,
                             RECOVERY_REJECT_BURST_TOO_LARGE, "burst_too_large");
         return RECOVERY_DECISION_REJECTED;
-    }
-    if (missing_packets > cc_missing_count) {
-        return 0;
     }
     if (engine->alignment.confidence < engine->config.min_alignment_confidence) {
         recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
@@ -1064,6 +1110,27 @@ static int try_recover_mixed_position_gap(recovery_engine_t *engine,
 
     primary_fits = record_fits_output_states(states, primary);
     if (!primary_fits) {
+        uint64_t cc_missing_count = 0;
+
+        if (has_previous_cc && infer_missing_from_cc(previous_cc, primary, &cc_missing_count) &&
+            cc_missing_count <= missing_packets) {
+            uint64_t matching_pid_count = 0;
+
+            for (i = 0; i < missing_packets; i++) {
+                packet_record_t *candidate = packet_history_find_index(&engine->history[1],
+                                                                       first_candidate_index + i);
+
+                if (candidate != NULL && !candidate->is_null && candidate->pid == primary->pid) {
+                    matching_pid_count++;
+                }
+            }
+            if (matching_pid_count == 0) {
+                recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
+                                    missing_packets, true, true, true, true,
+                                    RECOVERY_REJECT_WRONG_PID, "wrong_pid");
+                return RECOVERY_DECISION_REJECTED;
+            }
+        }
         recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
                             missing_packets, true, true, true, true,
                             RECOVERY_REJECT_WRONG_COUNTER, "after_anchor_wrong_counter");
@@ -1124,6 +1191,23 @@ static int try_recover_null_position_gap(recovery_engine_t *engine,
         return RECOVERY_DECISION_NONE;
     }
     if (missing_packets > engine->config.max_content_burst_packets) {
+        uint64_t scan_limit = (uint64_t)engine->config.max_content_burst_packets + 1ULL;
+
+        first_candidate_index = engine->last_primary_anchor.secondary_index + 1ULL;
+        for (i = 0; i < scan_limit; i++) {
+            packet_record_t *candidate = packet_history_find_index(&engine->history[1],
+                                                                   first_candidate_index + i);
+
+            if (candidate == NULL) {
+                recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
+                                    missing_packets, true, false, true, true,
+                                    RECOVERY_REJECT_MISSING_CANDIDATE, "missing_candidate");
+                return RECOVERY_DECISION_REJECTED;
+            }
+            if (!candidate->is_null) {
+                return RECOVERY_DECISION_NONE;
+            }
+        }
         recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
                             missing_packets, true, true, true, true,
                             RECOVERY_REJECT_BURST_TOO_LARGE, "null_burst_too_large");
@@ -1362,16 +1446,6 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
                 continue;
             }
         }
-        if (!primary_fits && engine->last_primary_anchor.valid && secondary_match != NULL) {
-            int recovered = try_recover_exact_content_gap(engine, primary, secondary_match);
-
-            if (recovered < 0) {
-                return -1;
-            }
-            logged_recovery_decision = recovered != RECOVERY_DECISION_NONE;
-            inserted_recovery = recovered == RECOVERY_DECISION_INSERTED;
-            primary_fits = record_fits_next_output(engine, primary);
-        }
         if (!inserted_recovery && !logged_recovery_decision &&
             engine->last_primary_anchor.valid && secondary_match != NULL) {
             int recovered = try_recover_null_position_gap(engine, primary, secondary_match);
@@ -1388,6 +1462,20 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         if (!inserted_recovery && !logged_recovery_decision &&
             engine->last_primary_anchor.valid && secondary_match != NULL) {
             int recovered = try_recover_mixed_position_gap(engine, primary, secondary_match);
+
+            if (recovered < 0) {
+                return -1;
+            }
+            if (recovered != RECOVERY_DECISION_NONE) {
+                logged_recovery_decision = true;
+                inserted_recovery = recovered == RECOVERY_DECISION_INSERTED;
+                primary_fits = record_fits_next_output(engine, primary);
+            }
+        }
+        if (!inserted_recovery && !logged_recovery_decision &&
+            !primary_fits &&
+            engine->last_primary_anchor.valid && secondary_match != NULL) {
+            int recovered = try_recover_exact_content_gap(engine, primary, secondary_match);
 
             if (recovered < 0) {
                 return -1;
