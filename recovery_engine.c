@@ -99,6 +99,23 @@ static void recovery_decision_log(const recovery_engine_t *engine,
     fflush(stdout);
 }
 
+static void observe_unrecoverable_primary_gap(recovery_engine_t *engine,
+                                              const packet_record_t *primary,
+                                              uint64_t missing_count,
+                                              bool has_missing_count,
+                                              const char *reason)
+{
+    if (!has_missing_count || missing_count == 0 ||
+        primary->is_null || primary->transport_error ||
+        primary->discontinuity_indicator) {
+        return;
+    }
+    if (reason != NULL && strncmp(reason, "null_", 5) == 0) {
+        return;
+    }
+    engine->stats->unrecoverable_loss += missing_count;
+}
+
 static void recovery_reject_log(recovery_engine_t *engine,
                                 const packet_record_t *primary,
                                 uint8_t previous_cc,
@@ -115,6 +132,8 @@ static void recovery_reject_log(recovery_engine_t *engine,
                           missing_count, has_missing_count, candidate_available,
                           before_anchor, after_anchor, "reject", reason);
     report_stats_reject_recovery(engine->stats, reject_reason);
+    observe_unrecoverable_primary_gap(engine, primary, missing_count,
+                                      has_missing_count, reason);
 }
 
 static int packet_history_init(packet_history_t *history, size_t capacity)
@@ -372,6 +391,8 @@ static void observe_input_path_gap(recovery_engine_t *engine, int stream_id,
         }
 
         if (gap && stream_id == 1) {
+            engine->stats->secondary_loss_events++;
+            engine->stats->secondary_missing_packets += has_missing_count ? missing_count : 1U;
             recovery_decision_log(engine, stream_id, record, state->continuity_counter,
                                   true, missing_count, has_missing_count, false, false, false,
                                   "reject", "secondary_input_gap");
