@@ -9,8 +9,6 @@
 #define OUTPUT_TS_PACKETS_PER_DATAGRAM 7U
 #define STAGE1_BOUNDARY_SEARCH_EXTRA 8U
 #define WIDE_ALIGNMENT_PROBE_INTERVAL 512ULL
-#define STAGE1_NOT_ATTEMPTED 0
-#define STAGE1_REJECTED (-2)
 
 static uint64_t hash_packet(const uint8_t packet[TS_PACKET_SIZE])
 {
@@ -195,6 +193,11 @@ static bool record_fits_output_states(const output_pid_state_t states[REPORT_STA
     return record->continuity_counter == expected;
 }
 
+static bool record_fits_next_output(recovery_engine_t *engine, const packet_record_t *record)
+{
+    return record_fits_output_states(engine->output_pid_state, record);
+}
+
 static void observe_output_states(output_pid_state_t states[REPORT_STATS_PIDS],
                                   const packet_record_t *record)
 {
@@ -211,11 +214,6 @@ static void observe_output_states(output_pid_state_t states[REPORT_STATS_PIDS],
     if (record->source_stream_id == 0) {
         state->last_primary_continuity_errors = record->stream_continuity_errors;
     }
-}
-
-static bool record_fits_next_output(recovery_engine_t *engine, const packet_record_t *record)
-{
-    return record_fits_output_states(engine->output_pid_state, record);
 }
 
 static void observe_output_record(recovery_engine_t *engine, const packet_record_t *record)
@@ -490,7 +488,7 @@ static packet_record_t *find_secondary_boundary_match(recovery_engine_t *engine,
     return NULL;
 }
 
-static int recover_stage1_anchored_primary_gap(recovery_engine_t *engine,
+static bool detect_stage1_anchored_primary_gap(recovery_engine_t *engine,
                                                const packet_record_t *primary,
                                                const packet_record_t *secondary_match)
 {
@@ -498,41 +496,39 @@ static int recover_stage1_anchored_primary_gap(recovery_engine_t *engine,
     uint64_t secondary_between;
     uint64_t missing_packets;
     uint64_t index;
-    uint64_t recovered_content = 0;
-    packet_record_t *candidates[RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS];
+    bool has_content = false;
     output_pid_state_t states[REPORT_STATS_PIDS];
 
     if (!engine->last_primary_anchor.valid || secondary_match == NULL) {
-        return 0;
+        return false;
     }
     if (secondary_match->stream_index <= engine->last_primary_anchor.secondary_index ||
         primary->stream_index <= engine->last_primary_anchor.primary_index) {
-        return 0;
+        return false;
     }
 
     primary_between = primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL;
     secondary_between = secondary_match->stream_index - engine->last_primary_anchor.secondary_index - 1ULL;
     if (secondary_between <= primary_between) {
-        return 0;
+        return false;
     }
     missing_packets = secondary_between - primary_between;
     if (missing_packets == 0) {
-        return 0;
+        return false;
+    }
+    if (record_fits_next_output(engine, primary)) {
+        return false;
     }
     if (primary_between != 0) {
-        decision_log("reject", "stage1-noncontiguous-primary-gap", primary->stream_index,
+        decision_log("detect", "stage1-noncontiguous-primary-gap", primary->stream_index,
                      secondary_match->stream_index, missing_packets);
-        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_AMBIGUOUS);
-        engine->stats->unrecoverable_loss++;
-        return STAGE1_REJECTED;
+        return true;
     }
     if (missing_packets > engine->config.max_content_burst_packets ||
         missing_packets > RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS) {
-        decision_log("reject", "stage1-gap-too-large", primary->stream_index,
+        decision_log("detect", "stage1-gap-too-large", primary->stream_index,
                      secondary_match->stream_index, missing_packets);
-        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_BURST_TOO_LARGE);
-        engine->stats->unrecoverable_loss++;
-        return STAGE1_REJECTED;
+        return true;
     }
 
     memcpy(states, engine->output_pid_state, sizeof(states));
@@ -540,60 +536,23 @@ static int recover_stage1_anchored_primary_gap(recovery_engine_t *engine,
         uint64_t secondary_index = engine->last_primary_anchor.secondary_index + 1ULL + index;
         packet_record_t *candidate = packet_history_find_index(&engine->history[1], secondary_index);
 
-        if (candidate == NULL) {
-            decision_log("reject", "stage1-missing-secondary-packet", primary->stream_index,
-                         secondary_index, missing_packets);
-            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_MISSING_CANDIDATE);
-            engine->stats->unrecoverable_loss++;
-            return STAGE1_REJECTED;
+        if (candidate == NULL || candidate->transport_error ||
+            candidate->discontinuity_indicator ||
+            !record_fits_output_states(states, candidate)) {
+            return false;
         }
-        if (candidate->transport_error) {
-            decision_log("reject", "stage1-secondary-tei", primary->stream_index,
-                         secondary_index, missing_packets);
-            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_TEI);
-            engine->stats->unrecoverable_loss++;
-            return STAGE1_REJECTED;
-        }
-        if (candidate->discontinuity_indicator) {
-            decision_log("reject", "stage1-secondary-discontinuity", primary->stream_index,
-                         secondary_index, missing_packets);
-            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_DISCONTINUITY);
-            engine->stats->unrecoverable_loss++;
-            return STAGE1_REJECTED;
-        }
-        if (!record_fits_output_states(states, candidate)) {
-            decision_log("reject", "stage1-secondary-cc-does-not-fit", primary->stream_index,
-                         secondary_index, missing_packets);
-            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
-            engine->stats->unrecoverable_loss++;
-            return STAGE1_REJECTED;
+        if (!candidate->is_null) {
+            has_content = true;
         }
         observe_output_states(states, candidate);
-        candidates[index] = candidate;
-        if (!candidate->is_null) {
-            recovered_content++;
-        }
     }
-    if (!record_fits_output_states(states, primary)) {
-        decision_log("reject", "stage1-primary-boundary-does-not-fit", primary->stream_index,
-                     secondary_match->stream_index, missing_packets);
-        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
-        engine->stats->unrecoverable_loss++;
-        return STAGE1_REJECTED;
+    if (!has_content || !record_fits_output_states(states, primary)) {
+        return false;
     }
 
-    for (index = 0; index < missing_packets; index++) {
-        if (output_record(engine, candidates[index]) != 0) {
-            return -1;
-        }
-        report_stats_observe_recovery(engine->stats, candidates[index]->is_null);
-    }
-    if (recovered_content > 1) {
-        engine->stats->recovered_content_bursts++;
-    }
-    decision_log("accept", "stage1-anchored-primary-gap", primary->stream_index,
+    decision_log("detect", "stage1-anchored-primary-gap", primary->stream_index,
                  secondary_match->stream_index, missing_packets);
-    return (int)missing_packets;
+    return true;
 }
 
 static bool stage1_has_anchored_primary_gap(const recovery_engine_t *engine,
@@ -750,64 +709,11 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 
         secondary_match = find_secondary_boundary_match(engine, primary);
         if (stage1_has_anchored_primary_gap(engine, primary, secondary_match)) {
-            int recovered = recover_stage1_anchored_primary_gap(engine, primary, secondary_match);
-
-            if (recovered < 0) {
-                if (recovered == STAGE1_REJECTED) {
-                    delay_queue_pop(&engine->primary_queue);
-                    continue;
-                }
-                return -1;
-            }
-            if (recovered > 0) {
-                if (!record_fits_next_output(engine, primary)) {
-                    decision_log("reject", "stage1-primary-boundary-does-not-fit-after-recovery",
-                                 primary->stream_index, secondary_match->stream_index, 0);
-                    report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
-                    engine->stats->unrecoverable_loss++;
-                    delay_queue_pop(&engine->primary_queue);
-                    continue;
-                }
-                if (output_record(engine, primary) != 0) {
-                    return -1;
-                }
-                update_primary_anchor(engine, primary, secondary_match);
-                engine->primary_gap.valid = true;
-                engine->primary_gap.arrival_time_ns = primary->arrival_time_ns;
-                engine->primary_gap.continuity_errors = primary->stream_continuity_errors;
-                engine->primary_gap.duplicate_counters = primary->stream_duplicate_counters;
-                delay_queue_pop(&engine->primary_queue);
-                continue;
-            }
+            (void)detect_stage1_anchored_primary_gap(engine, primary, secondary_match);
         }
         if (!record_fits_next_output(engine, primary)) {
-            int recovered = recover_stage1_anchored_primary_gap(engine, primary, secondary_match);
-
-            if (recovered < 0) {
-                if (recovered == STAGE1_REJECTED) {
-                    delay_queue_pop(&engine->primary_queue);
-                    continue;
-                }
-                return -1;
-            }
-            if (recovered > 0 && record_fits_next_output(engine, primary)) {
-                if (output_record(engine, primary) != 0) {
-                    return -1;
-                }
-                update_primary_anchor(engine, primary, secondary_match);
-                engine->primary_gap.valid = true;
-                engine->primary_gap.arrival_time_ns = primary->arrival_time_ns;
-                engine->primary_gap.continuity_errors = primary->stream_continuity_errors;
-                engine->primary_gap.duplicate_counters = primary->stream_duplicate_counters;
-                delay_queue_pop(&engine->primary_queue);
-                continue;
-            }
-            decision_log("reject", "stage0-primary-does-not-fit", primary->stream_index,
+            decision_log("detect", "stage0-primary-does-not-fit", primary->stream_index,
                          secondary_match != NULL ? secondary_match->stream_index : 0, 0);
-            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
-            engine->stats->unrecoverable_loss++;
-            delay_queue_pop(&engine->primary_queue);
-            continue;
         }
         if (output_record(engine, primary) != 0) {
             return -1;
