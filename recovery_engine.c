@@ -668,7 +668,7 @@ static int try_recover_exact_content_gap(recovery_engine_t *engine,
     uint8_t expected_missing_cc = 0;
     packet_record_t *before_primary;
     packet_record_t *before_secondary;
-    packet_record_t *candidates[16] = {0};
+    packet_record_t *candidates[256] = {0};
     uint64_t candidate_count;
     output_pid_state_t states[REPORT_STATS_PIDS];
     const char *decision;
@@ -695,11 +695,15 @@ static int try_recover_exact_content_gap(recovery_engine_t *engine,
     if (has_previous_cc) {
         has_cc_missing_count = infer_missing_from_cc(previous_cc, primary, &cc_missing_count);
     }
+    if (!has_cc_missing_count && has_previous_cc && primary->has_payload &&
+        missing_packets > 0 && missing_packets <= 15U &&
+        primary->continuity_counter ==
+            (uint8_t)((previous_cc + missing_packets + 1ULL) & 0x0fU)) {
+        cc_missing_count = missing_packets;
+        has_cc_missing_count = true;
+    }
     if (!has_cc_missing_count || cc_missing_count == 0) {
-        recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
-                            cc_missing_count, has_cc_missing_count, true, true, true,
-                            RECOVERY_REJECT_BURST_TOO_LARGE, "not_content_gap");
-        return RECOVERY_DECISION_REJECTED;
+        return RECOVERY_DECISION_NONE;
     }
     if (cc_missing_count > engine->config.max_content_burst_packets) {
         recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
@@ -954,6 +958,10 @@ static int try_recover_mixed_position_gap(recovery_engine_t *engine,
     bool has_previous_cc = previous_output_cc_for_record(engine, primary, &previous_cc);
     bool primary_fits;
     bool saw_content = false;
+    bool saw_null = false;
+    bool same_content_pid = true;
+    uint16_t content_pid = 0;
+    const char *decision;
     uint64_t i;
 
     if (primary->is_null || primary->transport_error || primary->discontinuity_indicator ||
@@ -1032,7 +1040,14 @@ static int try_recover_mixed_position_gap(recovery_engine_t *engine,
                                 RECOVERY_REJECT_DISCONTINUITY, "secondary_discontinuity");
             return RECOVERY_DECISION_REJECTED;
         }
-        if (!candidate->is_null) {
+        if (candidate->is_null) {
+            saw_null = true;
+        } else {
+            if (!saw_content) {
+                content_pid = candidate->pid;
+            } else if (candidate->pid != content_pid) {
+                same_content_pid = false;
+            }
             saw_content = true;
         }
         if (!record_fits_output_states(states, candidate)) {
@@ -1055,9 +1070,12 @@ static int try_recover_mixed_position_gap(recovery_engine_t *engine,
         return RECOVERY_DECISION_REJECTED;
     }
 
+    decision = !saw_null && same_content_pid && primary->pid == content_pid
+                   ? "recover_content_burst"
+                   : "recover_mixed_burst";
     recovery_decision_log(engine, 0, primary, previous_cc, has_previous_cc,
                           missing_packets, true, true, true, true,
-                          "recover_mixed_burst", NULL);
+                          decision, NULL);
     for (i = 0; i < missing_packets; i++) {
         packet_record_t *candidate = packet_history_find_index(&engine->history[1],
                                                                first_candidate_index + i);

@@ -1987,17 +1987,18 @@ static void test_generated_content_recovery_sweep(void)
     unsigned scenarios = 0;
 
     for (pid_index = 0; pid_index < sizeof(pids) / sizeof(pids[0]); pid_index++) {
-        for (gap = 1; gap <= 14; gap++) {
+        for (gap = 1; gap <= 16; gap++) {
             recovery_engine_t engine;
             report_stats_t stats;
             capture_sink_t capture;
             packet_sink_t sink;
             uint8_t primary_anchor[TS_PACKET_SIZE];
             uint8_t secondary_anchor[TS_PACKET_SIZE];
-            uint8_t expected_gap[14][TS_PACKET_SIZE];
+            uint8_t expected_gap[16][TS_PACKET_SIZE];
             size_t i;
 
             init_engine(&engine, &stats, &capture, &sink);
+            engine.config.max_content_burst_packets = 16;
             for (i = 0; i < 12; i++) {
                 push_pair(&engine, &stats, pids[pid_index], (uint8_t)i,
                           (uint8_t)(0x20 + pid_index + i));
@@ -2033,7 +2034,7 @@ static void test_generated_content_recovery_sweep(void)
         }
     }
 
-    assert(scenarios == 112);
+    assert(scenarios == 128);
 }
 
 static void test_generated_ambiguous_recovery_sweep(void)
@@ -2492,6 +2493,7 @@ int main(void)
     test_burst_gap_recovery();
     test_bounded_same_pid_burst_recovery_counts();
     test_bounded_same_pid_burst_respects_configured_max();
+    test_generated_content_recovery_sweep();
     test_mixed_pid_burst_recovery_with_null();
     test_mixed_pid_burst_rejects_counter_contradiction();
     test_null_only_gap_recovered_separately();
