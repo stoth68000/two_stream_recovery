@@ -40,12 +40,8 @@ live-test: $(BIN)
 		--input-secondary-url udp://127.0.0.1:4502 \
 		--output-url udp://127.0.0.1:4503 \
 		--primary-delay-ms 4000 \
-		--max-secondary-latency-ms 5000 \
 		--alignment-window-ms 6000 \
-		--history-ms 12000 \
-		--primary-outage-ms 50 \
-		--primary-return-ms 120000 \
+		--history-ms 10000 \
 		--max-content-burst-packets 255 \
-		--min-alignment-confidence 0 \
 		--http-port 4500 \
 		--console-report
