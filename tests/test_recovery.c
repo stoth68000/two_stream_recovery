@@ -666,6 +666,207 @@ static void test_exact_single_packet_content_recovery(void)
     recovery_engine_free(&engine);
 }
 
+static void test_exact_single_packet_recovery_after_stale_global_anchor(void)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t primary_interloper[TS_PACKET_SIZE];
+    uint8_t secondary_interloper[TS_PACKET_SIZE];
+    uint8_t secondary_c[TS_PACKET_SIZE];
+    uint8_t primary_d[TS_PACKET_SIZE];
+    uint8_t secondary_d[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    for (i = 0; i < 12; i++) {
+        push_pair(&engine, &stats, 0x032, (uint8_t)i, (uint8_t)(0x40 + i));
+    }
+
+    make_packet(primary_interloper, 0x200, 0, 0x90);
+    make_packet(secondary_interloper, 0x200, 0, 0xa0);
+    make_packet(secondary_c, 0x032, 12, 0x70);
+    make_packet(primary_d, 0x032, 13, 0x71);
+    make_packet(secondary_d, 0x032, 13, 0x71);
+
+    push_packet(&engine, &stats, 0, primary_interloper);
+    push_packet(&engine, &stats, 1, secondary_interloper);
+    push_packet(&engine, &stats, 1, secondary_c);
+    push_packet(&engine, &stats, 0, primary_d);
+    push_packet(&engine, &stats, 1, secondary_d);
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == 15);
+    assert(memcmp(capture.packets[12], primary_interloper, TS_PACKET_SIZE) == 0);
+    assert(memcmp(capture.packets[13], secondary_c, TS_PACKET_SIZE) == 0);
+    assert(memcmp(capture.packets[14], primary_d, TS_PACKET_SIZE) == 0);
+    assert(stats.recovered_content_packets == 1);
+    assert(stats.recovered_packets == 1);
+    assert(stats.unrecoverable_loss == 0);
+    assert(stats.output_continuity_errors == 0);
+
+    recovery_engine_free(&engine);
+}
+
+static void test_primary_tei_packet_replaced_from_clean_secondary(void)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t primary_c[TS_PACKET_SIZE];
+    uint8_t secondary_c[TS_PACKET_SIZE];
+    uint8_t primary_d[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    for (i = 0; i < 12; i++) {
+        push_pair(&engine, &stats, 0x120, (uint8_t)i, (uint8_t)(0x50 + i));
+    }
+
+    make_packet(primary_c, 0x120, 12, 0x70);
+    make_packet(secondary_c, 0x120, 12, 0x70);
+    mark_transport_error(primary_c);
+    make_packet(primary_d, 0x120, 13, 0x71);
+
+    push_packet(&engine, &stats, 1, secondary_c);
+    push_packet(&engine, &stats, 0, primary_c);
+    push_packet(&engine, &stats, 1, primary_d);
+    push_packet(&engine, &stats, 0, primary_d);
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == 14);
+    assert(memcmp(capture.packets[12], secondary_c, TS_PACKET_SIZE) == 0);
+    assert(memcmp(capture.packets[12], primary_c, TS_PACKET_SIZE) != 0);
+    assert(memcmp(capture.packets[13], primary_d, TS_PACKET_SIZE) == 0);
+    assert(stats.transport_errors[0] == 1);
+    assert(stats.recovered_content_packets == 1);
+    assert(stats.recovered_null_packets == 0);
+    assert(stats.recovered_packets == 1);
+    assert(stats.unrecoverable_loss == 0);
+    assert(stats.output_continuity_errors == 0);
+
+    recovery_engine_free(&engine);
+}
+
+static void test_primary_tei_packet_not_replaced_from_tei_secondary(void)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t primary_c[TS_PACKET_SIZE];
+    uint8_t secondary_c[TS_PACKET_SIZE];
+    uint8_t primary_d[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    for (i = 0; i < 12; i++) {
+        push_pair(&engine, &stats, 0x121, (uint8_t)i, (uint8_t)(0x60 + i));
+    }
+
+    make_packet(primary_c, 0x121, 12, 0x80);
+    make_packet(secondary_c, 0x121, 12, 0x80);
+    mark_transport_error(primary_c);
+    mark_transport_error(secondary_c);
+    make_packet(primary_d, 0x121, 13, 0x81);
+
+    push_packet(&engine, &stats, 1, secondary_c);
+    push_packet(&engine, &stats, 0, primary_c);
+    push_packet(&engine, &stats, 1, primary_d);
+    push_packet(&engine, &stats, 0, primary_d);
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == 14);
+    assert(memcmp(capture.packets[12], primary_c, TS_PACKET_SIZE) == 0);
+    assert(memcmp(capture.packets[12], secondary_c, TS_PACKET_SIZE) == 0);
+    assert(memcmp(capture.packets[13], primary_d, TS_PACKET_SIZE) == 0);
+    assert(stats.transport_errors[0] == 1);
+    assert(stats.transport_errors[1] == 1);
+    assert(stats.recovered_content_packets == 0);
+    assert(stats.recovered_packets == 0);
+    assert(stats.unrecoverable_loss == 0);
+    assert(stats.recovery_rejects[RECOVERY_REJECT_TEI] == 1);
+
+    recovery_engine_free(&engine);
+}
+
+typedef enum single_recovery_negative_case {
+    SINGLE_NEGATIVE_TEI,
+    SINGLE_NEGATIVE_WRONG_PID,
+    SINGLE_NEGATIVE_WRONG_CC,
+    SINGLE_NEGATIVE_MISSING_CANDIDATE,
+    SINGLE_NEGATIVE_LOW_ALIGNMENT,
+    SINGLE_NEGATIVE_NO_AFTER_ANCHOR
+} single_recovery_negative_case_t;
+
+static void run_single_packet_negative_recovery_case(single_recovery_negative_case_t negative_case,
+                                                     recovery_reject_reason_t expected_reason)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t primary_d[TS_PACKET_SIZE];
+    uint8_t secondary_c[TS_PACKET_SIZE];
+    uint8_t secondary_d[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.config.min_alignment_confidence = 80;
+    for (i = 0; i < 12; i++) {
+        push_pair(&engine, &stats, 0x110, (uint8_t)i, (uint8_t)(0x40 + i));
+    }
+
+    make_packet(secondary_c, 0x110, 12, 0x70);
+    make_packet(primary_d, 0x110, 13, 0x71);
+    make_packet(secondary_d, 0x110, 13, 0x71);
+    if (negative_case == SINGLE_NEGATIVE_TEI) {
+        mark_transport_error(secondary_c);
+    } else if (negative_case == SINGLE_NEGATIVE_WRONG_PID) {
+        make_packet(secondary_c, 0x111, 12, 0x70);
+    } else if (negative_case == SINGLE_NEGATIVE_WRONG_CC) {
+        make_packet(secondary_c, 0x110, 11, 0x70);
+    } else if (negative_case == SINGLE_NEGATIVE_LOW_ALIGNMENT) {
+        engine.alignment.confidence = 0;
+        stats.alignment_confidence = 0;
+    }
+    if (negative_case != SINGLE_NEGATIVE_MISSING_CANDIDATE) {
+        push_packet(&engine, &stats, 1, secondary_c);
+    }
+    push_packet(&engine, &stats, 0, primary_d);
+    if (negative_case != SINGLE_NEGATIVE_NO_AFTER_ANCHOR) {
+        push_packet(&engine, &stats, 1, secondary_d);
+    }
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == 13);
+    assert(memcmp(capture.packets[12], primary_d, TS_PACKET_SIZE) == 0);
+    assert(memcmp(capture.packets[12], secondary_c, TS_PACKET_SIZE) != 0);
+    assert(stats.recovered_content_packets == 0);
+    assert(stats.recovered_packets == 0);
+    assert(stats.unrecoverable_loss == 0);
+    assert(stats.output_continuity_errors == 1);
+    assert(stats.recovery_rejects[expected_reason] == 1);
+
+    recovery_engine_free(&engine);
+}
+
+static void test_exact_single_packet_content_recovery_negative_cases(void)
+{
+    run_single_packet_negative_recovery_case(SINGLE_NEGATIVE_TEI, RECOVERY_REJECT_TEI);
+    run_single_packet_negative_recovery_case(SINGLE_NEGATIVE_WRONG_PID, RECOVERY_REJECT_WRONG_PID);
+    run_single_packet_negative_recovery_case(SINGLE_NEGATIVE_WRONG_CC,
+                                             RECOVERY_REJECT_WRONG_COUNTER);
+    run_single_packet_negative_recovery_case(SINGLE_NEGATIVE_MISSING_CANDIDATE,
+                                             RECOVERY_REJECT_MISSING_CANDIDATE);
+    run_single_packet_negative_recovery_case(SINGLE_NEGATIVE_LOW_ALIGNMENT,
+                                             RECOVERY_REJECT_LOW_ALIGNMENT);
+    run_single_packet_negative_recovery_case(SINGLE_NEGATIVE_NO_AFTER_ANCHOR,
+                                             RECOVERY_REJECT_AMBIGUOUS);
+}
+
 static void test_burst_gap_detection_only(void)
 {
     recovery_engine_t engine;
@@ -1950,6 +2151,10 @@ int main(void)
     test_primary_pass_through();
     test_clean_dual_input_baseline_no_recovery();
     test_exact_single_packet_content_recovery();
+    test_exact_single_packet_recovery_after_stale_global_anchor();
+    test_primary_tei_packet_replaced_from_clean_secondary();
+    test_primary_tei_packet_not_replaced_from_tei_secondary();
+    test_exact_single_packet_content_recovery_negative_cases();
     test_burst_gap_detection_only();
     test_anchor_gap_detection_only_with_counter_wrap();
     printf("test_recovery: ok\n");
