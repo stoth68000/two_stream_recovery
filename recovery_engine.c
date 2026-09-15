@@ -470,6 +470,18 @@ static int output_record(recovery_engine_t *engine, const packet_record_t *recor
     return 0;
 }
 
+static void set_active_output_stream(recovery_engine_t *engine, int stream_id)
+{
+    if (stream_id < 0 || stream_id > 1 ||
+        engine->active_output_stream_id == stream_id) {
+        return;
+    }
+
+    engine->active_output_stream_id = stream_id;
+    engine->stats->active_output_stream_id = stream_id;
+    engine->stats->source_switches[stream_id]++;
+}
+
 static size_t history_capacity_from_config(const recovery_engine_config_t *config)
 {
     uint64_t capacity = RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS;
@@ -655,6 +667,69 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
     } else {
         update_alignment_from_match(engine, match, record);
     }
+}
+
+static bool primary_is_silent_beyond_outage(const recovery_engine_t *engine, uint64_t now_ns)
+{
+    if (engine->config.primary_outage_ns == 0 ||
+        engine->last_input_arrival_ns[1] == 0) {
+        return false;
+    }
+    if (engine->last_input_arrival_ns[0] == 0) {
+        return false;
+    }
+    if (engine->last_input_arrival_ns[0] > now_ns) {
+        return false;
+    }
+    return now_ns - engine->last_input_arrival_ns[0] >= engine->config.primary_outage_ns;
+}
+
+static int drain_secondary_on_primary_outage(recovery_engine_t *engine, bool force, uint64_t now_ns)
+{
+    if (engine->active_output_stream_id != 1 &&
+        !primary_is_silent_beyond_outage(engine, now_ns)) {
+        return 0;
+    }
+
+    while (engine->secondary_queue.count > 0) {
+        packet_record_t *secondary = delay_queue_front(&engine->secondary_queue);
+
+        if (secondary == NULL) {
+            break;
+        }
+        now_ns = report_stats_now_ns();
+        if (!force && secondary->arrival_time_ns <= now_ns &&
+            now_ns - secondary->arrival_time_ns < engine->secondary_queue.delay_ns) {
+            break;
+        }
+        set_active_output_stream(engine, 1);
+        if (output_record(engine, secondary) != 0) {
+            return -1;
+        }
+        delay_queue_pop(&engine->secondary_queue);
+    }
+
+    return 0;
+}
+
+static bool primary_return_holdoff_elapsed(recovery_engine_t *engine, uint64_t now_ns)
+{
+    if (engine->active_output_stream_id != 1) {
+        engine->primary_return_start_ns = 0;
+        return true;
+    }
+    if (primary_is_silent_beyond_outage(engine, now_ns)) {
+        engine->primary_return_start_ns = 0;
+        return false;
+    }
+    if (engine->last_input_arrival_ns[0] == 0) {
+        engine->primary_return_start_ns = 0;
+        return false;
+    }
+    if (engine->primary_return_start_ns == 0) {
+        engine->primary_return_start_ns = now_ns;
+    }
+    return now_ns - engine->primary_return_start_ns >= engine->config.primary_return_ns;
 }
 
 static void find_secondary_boundary_matches(recovery_engine_t *engine,
@@ -1984,6 +2059,12 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 {
     uint64_t now_ns = report_stats_now_ns();
 
+    if (engine->primary_queue.count == 0 ||
+        !primary_return_holdoff_elapsed(engine, now_ns)) {
+        return drain_secondary_on_primary_outage(engine, force, now_ns);
+    }
+    set_active_output_stream(engine, 0);
+
     while (engine->primary_queue.count > 0) {
         packet_record_t *primary = delay_queue_front(&engine->primary_queue);
         secondary_after_anchor_candidates_t secondary_matches;
@@ -1996,6 +2077,11 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             break;
         }
         now_ns = report_stats_now_ns();
+        if (engine->active_output_stream_id == 1 &&
+            !primary_return_holdoff_elapsed(engine, now_ns)) {
+            return drain_secondary_on_primary_outage(engine, force, now_ns);
+        }
+        set_active_output_stream(engine, 0);
         if (!force && primary->arrival_time_ns <= now_ns &&
             now_ns - primary->arrival_time_ns < engine->primary_queue.delay_ns) {
             break;
@@ -2109,6 +2195,9 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         delay_queue_pop(&engine->primary_queue);
     }
 
+    if (engine->primary_queue.count == 0) {
+        return drain_secondary_on_primary_outage(engine, force, report_stats_now_ns());
+    }
     return 0;
 }
 

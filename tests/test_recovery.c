@@ -1297,6 +1297,102 @@ static void test_secondary_outage_keeps_primary_output(void)
     recovery_engine_free(&engine);
 }
 
+static void test_primary_outage_drains_secondary(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+    uint64_t now_ns;
+    size_t i;
+
+    config.primary_delay_ns = 0;
+    config.primary_outage_ns = 1000000000ULL;
+    config.primary_return_ns = 1000000000ULL;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    for (i = 0; i < 4; i++) {
+        make_packet(packet, 0x126, (uint8_t)i, (uint8_t)(0x40 + i));
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(capture.packet_count == 4);
+    assert(engine.active_output_stream_id == 0);
+
+    now_ns = report_stats_now_ns();
+    engine.last_input_arrival_ns[0] = now_ns - 2000000000ULL;
+    for (i = 4; i < 9; i++) {
+        make_packet(packet, 0x126, (uint8_t)i, (uint8_t)(0x40 + i));
+        push_packet(&engine, &stats, 1, packet);
+    }
+
+    assert(engine.active_output_stream_id == 1);
+    assert(stats.active_output_stream_id == 1);
+    assert(stats.source_switches[1] == 1);
+    assert(capture.packet_count == 9);
+    assert(stats.output_continuity_errors == 0);
+    for (i = 0; i < 9; i++) {
+        make_packet(packet, 0x126, (uint8_t)i, (uint8_t)(0x40 + i));
+        assert(memcmp(capture.packets[i], packet, TS_PACKET_SIZE) == 0);
+    }
+
+    recovery_engine_free(&engine);
+}
+
+static void test_primary_return_holdoff_keeps_secondary_active(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+    uint64_t now_ns;
+    size_t i;
+
+    config.primary_delay_ns = 0;
+    config.primary_outage_ns = 1000000000ULL;
+    config.primary_return_ns = 1000000000ULL;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    for (i = 0; i < 4; i++) {
+        make_packet(packet, 0x127, (uint8_t)i, (uint8_t)(0x50 + i));
+        push_packet(&engine, &stats, 0, packet);
+    }
+    now_ns = report_stats_now_ns();
+    engine.last_input_arrival_ns[0] = now_ns - 2000000000ULL;
+    for (i = 4; i < 7; i++) {
+        make_packet(packet, 0x127, (uint8_t)i, (uint8_t)(0x50 + i));
+        push_packet(&engine, &stats, 1, packet);
+    }
+    assert(engine.active_output_stream_id == 1);
+    assert(capture.packet_count == 7);
+
+    for (i = 7; i < 10; i++) {
+        make_packet(packet, 0x127, (uint8_t)i, (uint8_t)(0x50 + i));
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(engine.active_output_stream_id == 1);
+    assert(stats.source_switches[0] == 0);
+    assert(capture.packet_count == 7);
+
+    engine.primary_return_start_ns = report_stats_now_ns() - 2000000000ULL;
+    assert(recovery_engine_drain(&engine, false) == 0);
+    assert(engine.active_output_stream_id == 0);
+    assert(stats.source_switches[0] == 1);
+    assert(capture.packet_count == 10);
+    assert(stats.output_continuity_errors == 0);
+    for (i = 0; i < 10; i++) {
+        make_packet(packet, 0x127, (uint8_t)i, (uint8_t)(0x50 + i));
+        assert(memcmp(capture.packets[i], packet, TS_PACKET_SIZE) == 0);
+    }
+
+    recovery_engine_free(&engine);
+}
+
 static void make_live_equivalent_packet(uint8_t packet[TS_PACKET_SIZE],
                                         uint8_t continuity_counters[3],
                                         size_t sequence)
@@ -2362,6 +2458,8 @@ int main(void)
     test_mixed_pid_burst_recovery_with_null();
     test_mixed_pid_burst_rejects_counter_contradiction();
     test_secondary_outage_keeps_primary_output();
+    test_primary_outage_drains_secondary();
+    test_primary_return_holdoff_keeps_secondary_active();
     test_live_equivalent_one_datagram_loss_recovers();
     test_live_equivalent_two_datagram_loss_recovers();
     test_live_equivalent_fifteen_datagram_loss_recovers_when_configured();
