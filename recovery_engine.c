@@ -643,7 +643,7 @@ static void find_secondary_boundary_matches(recovery_engine_t *engine,
 
     memset(candidates, 0, sizeof(*candidates));
 
-    if (primary->transport_error || primary->discontinuity_indicator) {
+    if (primary->is_null || primary->transport_error || primary->discontinuity_indicator) {
         return;
     }
     if (engine->alignment.has_alignment) {

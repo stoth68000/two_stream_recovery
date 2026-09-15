@@ -639,6 +639,40 @@ static void test_clean_dual_input_baseline_no_recovery(void)
     recovery_engine_free(&engine);
 }
 
+static void test_repeated_null_packets_do_not_create_anchor_ambiguity(void)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t content[12][TS_PACKET_SIZE];
+    uint8_t null_packet[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    for (i = 0; i < 12; i++) {
+        make_packet(content[i], 0x100, (uint8_t)(i & 0x0fU), (uint8_t)(0x40 + i));
+        stamp_packet_unique(content[i], 0x1fff, (uint16_t)i);
+        push_packet(&engine, &stats, 0, content[i]);
+        push_packet(&engine, &stats, 1, content[i]);
+    }
+    make_null_packet(null_packet, 0x55);
+    for (i = 0; i < 96; i++) {
+        push_packet(&engine, &stats, 0, null_packet);
+        push_packet(&engine, &stats, 1, null_packet);
+    }
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == 108);
+    assert(stats.recovered_packets == 0);
+    assert(stats.recovered_content_packets == 0);
+    assert(stats.recovered_null_packets == 0);
+    assert(stats.recovery_rejects[RECOVERY_REJECT_AMBIGUOUS] == 0);
+    assert(stats.output_continuity_errors == 0);
+
+    recovery_engine_free(&engine);
+}
+
 static void test_exact_single_packet_content_recovery(void)
 {
     recovery_engine_t engine;
@@ -2696,6 +2730,7 @@ int main(void)
     test_report_stats_health_recovers_after_quiet_window();
     test_primary_pass_through();
     test_clean_dual_input_baseline_no_recovery();
+    test_repeated_null_packets_do_not_create_anchor_ambiguity();
     test_exact_single_packet_content_recovery();
     test_exact_single_packet_recovery_after_stale_global_anchor();
     test_null_match_does_not_replace_recovery_anchor();
