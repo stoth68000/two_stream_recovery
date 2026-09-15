@@ -72,6 +72,19 @@ static packet_record_t *packet_history_push(packet_history_t *history)
     return &history->records[index];
 }
 
+static void packet_history_prune_older_than(packet_history_t *history, uint64_t cutoff_ns)
+{
+    while (history->count > 0) {
+        packet_record_t *oldest = &history->records[history->start];
+
+        if (oldest->arrival_time_ns >= cutoff_ns) {
+            break;
+        }
+        history->start = (history->start + 1U) % history->capacity;
+        history->count--;
+    }
+}
+
 static packet_record_t *packet_history_find_index(packet_history_t *history, uint64_t stream_index)
 {
     uint64_t oldest_stream_index;
@@ -646,6 +659,7 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
                                 const ts_packet_info_t *info)
 {
     packet_record_t *record;
+    uint64_t history_retention_ns;
 
     if (stream_id < 0 || stream_id > 1) {
         return -1;
@@ -655,6 +669,7 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
     memset(record, 0, sizeof(*record));
     record->source_stream_id = stream_id;
     record->stream_index = engine->next_stream_index[stream_id]++;
+    gettimeofday(&record->arrival_time, NULL);
     record->arrival_time_ns = report_stats_now_ns();
     record->pid = info->pid;
     record->continuity_counter = info->continuity_counter;
@@ -669,6 +684,11 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
     record->hash = hash_packet(packet);
     memcpy(record->packet, packet, TS_PACKET_SIZE);
     engine->last_input_arrival_ns[stream_id] = record->arrival_time_ns;
+    history_retention_ns = engine->config.history_ms * 1000000ULL;
+    if (history_retention_ns > 0 && record->arrival_time_ns > history_retention_ns) {
+        packet_history_prune_older_than(&engine->history[stream_id],
+                                        record->arrival_time_ns - history_retention_ns);
+    }
 
     update_alignment(engine, stream_id, record);
 

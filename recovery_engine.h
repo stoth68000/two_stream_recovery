@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/time.h>
 
 #define RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS 65536
 #define RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS 2048
@@ -15,7 +16,7 @@
 #define RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS 2500000000ULL
 #define RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS 5000000000ULL
 #define RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS 6000000000ULL
-#define RECOVERY_ENGINE_DEFAULT_HISTORY_MS 6000ULL
+#define RECOVERY_ENGINE_DEFAULT_HISTORY_MS 10000ULL
 #define RECOVERY_ENGINE_DEFAULT_MIN_ALIGNMENT_CONFIDENCE 40U
 #define RECOVERY_ENGINE_DEFAULT_PRIMARY_OUTAGE_NS 50000000ULL
 #define RECOVERY_ENGINE_DEFAULT_PRIMARY_RETURN_NS 120000000000ULL
@@ -74,6 +75,7 @@ typedef struct output_pid_state {
 typedef struct packet_record {
     int source_stream_id;
     uint64_t stream_index;
+    struct timeval arrival_time;
     uint64_t arrival_time_ns;
     uint16_t pid;
     uint8_t continuity_counter;

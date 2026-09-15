@@ -362,6 +362,7 @@ static void test_recovery_engine_config(void)
     assert(config.primary_delay_ns == RECOVERY_ENGINE_DEFAULT_PRIMARY_DELAY_NS);
     assert(config.max_secondary_latency_ns == RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS);
     assert(config.alignment_window_ns == RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS);
+    assert(config.history_ms == 10000ULL);
 
     config.primary_delay_ns = 123000000ULL;
     config.max_secondary_latency_ns = 456000000ULL;
@@ -381,6 +382,46 @@ static void test_recovery_engine_config(void)
     assert(engine.config.max_content_burst_packets == 255U);
     assert(engine.config.min_alignment_confidence == 100U);
     assert(engine.history[0].capacity > RECOVERY_ENGINE_DEFAULT_HISTORY_PACKETS);
+    recovery_engine_free(&engine);
+}
+
+static void test_packet_metadata_history_retains_configured_time_window(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    packet_record_t *first;
+    packet_record_t *second;
+    uint64_t first_hash;
+    uint8_t first_packet[TS_PACKET_SIZE];
+    uint8_t second_packet[TS_PACKET_SIZE];
+
+    config.history_ms = 1ULL;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    make_packet(first_packet, 0x120, 0, 0x11);
+    push_packet(&engine, &stats, 0, first_packet);
+    assert(engine.history[0].count == 1);
+    first = &engine.history[0].records[engine.history[0].start];
+    assert(first->stream_index == 0);
+    assert(first->arrival_time.tv_sec != 0 || first->arrival_time.tv_usec != 0);
+    assert(first->arrival_time_ns != 0);
+    assert(memcmp(first->packet, first_packet, TS_PACKET_SIZE) == 0);
+    first_hash = first->hash;
+    first->arrival_time_ns = 0;
+
+    make_packet(second_packet, 0x120, 1, 0x11);
+    second_packet[TS_PACKET_SIZE - 1] ^= 0x01U;
+    push_packet(&engine, &stats, 0, second_packet);
+
+    assert(engine.history[0].count == 1);
+    second = &engine.history[0].records[engine.history[0].start];
+    assert(second->stream_index == 1);
+    assert(second->hash != first_hash);
+    assert(memcmp(second->packet, second_packet, TS_PACKET_SIZE) == 0);
+
     recovery_engine_free(&engine);
 }
 
@@ -1900,6 +1941,7 @@ int main(void)
     test_output_udp_pending_batch();
     test_packet_sink_helpers();
     test_recovery_engine_config();
+    test_packet_metadata_history_retains_configured_time_window();
     test_ts_packet_parse();
     test_ts_packet_parse_edges();
     test_report_stats_observe_edges();
