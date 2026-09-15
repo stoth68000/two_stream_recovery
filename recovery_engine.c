@@ -87,8 +87,10 @@ static void recovery_decision_log(const recovery_engine_t *engine,
     } else {
         printf(" missing=unknown");
     }
-    printf(" align=%u candidate=%s before=%s after=%s decision=%s",
+    printf(" align=%u candidate=%s candidates=%zu truncated=%s before=%s after=%s decision=%s",
            engine->alignment.confidence, yes_no(candidate_available),
+           engine->decision_candidate_count,
+           yes_no(engine->decision_candidates_truncated),
            yes_no(before_anchor), yes_no(after_anchor), decision);
     if (reason != NULL && reason[0] != '\0') {
         printf(" reason=%s", reason);
@@ -1934,6 +1936,8 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
                                         record->arrival_time_ns - history_retention_ns);
     }
 
+    engine->decision_candidate_count = 0;
+    engine->decision_candidates_truncated = false;
     observe_input_path_gap(engine, stream_id, record);
     update_alignment(engine, stream_id, record);
 
@@ -1977,6 +1981,8 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         }
 
         find_secondary_boundary_matches(engine, primary, &secondary_matches);
+        engine->decision_candidate_count = secondary_matches.count;
+        engine->decision_candidates_truncated = secondary_matches.truncated;
         if (secondary_matches.count == 1 && !secondary_matches.truncated) {
             single_secondary_match = secondary_matches.records[0];
         }

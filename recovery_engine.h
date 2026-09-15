@@ -150,6 +150,8 @@ typedef struct recovery_engine {
     primary_gap_state_t primary_gap;
     input_pid_state_t input_pid_state[REPORT_STATS_STREAMS][REPORT_STATS_PIDS];
     output_pid_state_t output_pid_state[REPORT_STATS_PIDS];
+    size_t decision_candidate_count;
+    bool decision_candidates_truncated;
 } recovery_engine_t;
 
 recovery_engine_config_t recovery_engine_default_config(void);

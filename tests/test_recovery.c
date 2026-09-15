@@ -80,6 +80,14 @@ static void make_null_packet(uint8_t packet[TS_PACKET_SIZE], uint8_t marker)
     make_packet(packet, TS_NULL_PID, 0, marker);
 }
 
+static void make_adaptation_only_packet(uint8_t packet[TS_PACKET_SIZE], uint16_t pid,
+                                        uint8_t continuity_counter, uint8_t marker)
+{
+    make_packet(packet, pid, continuity_counter, marker);
+    packet[3] = (uint8_t)(0x20U | (continuity_counter & 0x0fU));
+    packet[4] = 0;
+}
+
 static void make_pcr_packet(uint8_t packet[TS_PACKET_SIZE], uint16_t pid, uint8_t continuity_counter,
                             uint64_t pcr_base)
 {
@@ -2276,6 +2284,97 @@ static void test_same_pid_position_gap_recovers_after_stale_anchor_prefix(void)
     recovery_engine_free(&engine);
 }
 
+static void run_repeated_after_anchor_candidate_case(unsigned duplicate_after_anchors,
+                                                     bool make_second_candidate_valid,
+                                                     bool expect_recovery,
+                                                     bool expect_truncated)
+{
+    enum {
+        WARMUP_PACKETS = 12,
+        CONTENT_PID = 0x0410,
+        AFTER_PID = 0x0411
+    };
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t missing[TS_PACKET_SIZE];
+    uint8_t bad_content[TS_PACKET_SIZE];
+    uint8_t null_packet[TS_PACKET_SIZE];
+    uint8_t after_anchor[TS_PACKET_SIZE];
+    unsigned i;
+
+    assert(duplicate_after_anchors >= 1);
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.config.max_content_burst_packets = 255;
+
+    for (i = 0; i < WARMUP_PACKETS; i++) {
+        uint8_t packet[TS_PACKET_SIZE];
+
+        make_packet(packet, CONTENT_PID, (uint8_t)(i & 0x0fU), (uint8_t)(0x20 + i));
+        stamp_packet_unique(packet, 0x4100, (uint16_t)i);
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(engine.last_primary_anchor.valid);
+
+    make_packet(missing, CONTENT_PID, (uint8_t)(WARMUP_PACKETS & 0x0fU), 0x80);
+    stamp_packet_unique(missing, 0x4110, 0);
+    make_adaptation_only_packet(after_anchor, AFTER_PID, 0, 0xa0);
+    stamp_packet_unique(after_anchor, 0x4120, 0);
+    make_packet(bad_content, CONTENT_PID, (uint8_t)(WARMUP_PACKETS & 0x0fU), 0xb0);
+    stamp_packet_unique(bad_content, 0x4130, 0);
+    make_null_packet(null_packet, 0xc0);
+    stamp_packet_unique(null_packet, 0x4140, 0);
+
+    push_packet(&engine, &stats, 1, missing);
+    for (i = 0; i < duplicate_after_anchors; i++) {
+        push_packet(&engine, &stats, 1, after_anchor);
+        if (i + 1U < duplicate_after_anchors) {
+            push_packet(&engine, &stats, 1,
+                        make_second_candidate_valid ? null_packet : bad_content);
+        }
+    }
+    push_packet(&engine, &stats, 0, after_anchor);
+
+    assert(recovery_engine_flush(&engine) == 0);
+    if (expect_recovery) {
+        assert(capture.packet_count == WARMUP_PACKETS + 2);
+        assert(memcmp(capture.packets[WARMUP_PACKETS], missing, TS_PACKET_SIZE) == 0);
+        assert(memcmp(capture.packets[WARMUP_PACKETS + 1], after_anchor,
+                      TS_PACKET_SIZE) == 0);
+        assert(stats.recovered_packets == 1);
+        assert(stats.recovered_content_packets == 1);
+        assert(stats.recovery_rejects[RECOVERY_REJECT_AMBIGUOUS] == 0);
+        assert(stats.output_continuity_errors == 0);
+    } else {
+        assert(capture.packet_count == WARMUP_PACKETS + 1);
+        assert(memcmp(capture.packets[WARMUP_PACKETS], after_anchor,
+                      TS_PACKET_SIZE) == 0);
+        assert(stats.recovered_packets == 0);
+        assert(stats.recovery_rejects[RECOVERY_REJECT_AMBIGUOUS] == 1);
+    }
+    assert(engine.decision_candidates_truncated == expect_truncated);
+
+    recovery_engine_free(&engine);
+}
+
+static void test_repeated_after_anchor_one_valid_candidate_recovers(void)
+{
+    run_repeated_after_anchor_candidate_case(2, false, true, false);
+}
+
+static void test_repeated_after_anchor_multiple_valid_candidates_rejects(void)
+{
+    run_repeated_after_anchor_candidate_case(2, true, false, false);
+}
+
+static void test_repeated_after_anchor_too_many_candidates_rejects(void)
+{
+    run_repeated_after_anchor_candidate_case(65, true, false, true);
+}
+
 static void test_pid_time_range_recovery_wrap_gap(void)
 {
     enum {
@@ -2896,6 +2995,9 @@ int main(void)
     test_same_pid_gap_16_recovers_with_raised_max_and_position_anchors();
     test_same_pid_gap_17_plus_recovers_with_position_anchors();
     test_same_pid_position_gap_recovers_after_stale_anchor_prefix();
+    test_repeated_after_anchor_one_valid_candidate_recovers();
+    test_repeated_after_anchor_multiple_valid_candidates_rejects();
+    test_repeated_after_anchor_too_many_candidates_rejects();
     printf("test_recovery: ok\n");
     return 0;
 }
