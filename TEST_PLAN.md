@@ -87,6 +87,66 @@ Every test should record the console output. Pay special attention to:
 - `output_datagrams`
 - `output_short_flushes`
 
+## Live-Test Curl Endpoints
+
+These URLs are used with the `make live-test` topology, where the tool receives
+primary input on `udp://127.0.0.1:4501`, secondary input on
+`udp://127.0.0.1:4502`, and sends recovered output to
+`udp://127.0.0.1:4503`.
+
+Reset the downstream probe before each manual loss test:
+
+```sh
+curl -s -X POST http://127.0.0.1:9800/api/reset
+```
+
+Use this immediately before a test injection so downstream packet and continuity
+error counters start from zero for that specific test case.
+
+Read the downstream probe after baseline settling and after every loss test:
+
+```sh
+curl -s http://127.0.0.1:9800/api/transport-streams
+```
+
+Look for the output stream entry for `127.0.0.1:4503`. Use it to verify output
+CC errors, inter-packet-arrival stability, bitrate, and datagram size. For the
+clean baseline, the output must have zero CC errors and 1316-byte datagrams.
+
+Read the tool's own REST stats during baseline and after each injected loss:
+
+```sh
+curl -s http://127.0.0.1:4500/api/stats
+```
+
+Use this to confirm alignment, input CC counters, recovery counters,
+unrecoverable counters, recovery reject reasons, output packet count, and output
+datagram count.
+
+Create primary input loss:
+
+```sh
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"packets":60}' \
+  'http://127.0.0.1:9501/api/drop'
+```
+
+Port `9501` controls the primary input loss injector. Change the `packets` value
+for the specific test case, for example 1, 20, 60, 4000, or another planned
+count.
+
+Create secondary input loss:
+
+```sh
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"packets":60}' \
+  'http://127.0.0.1:9502/api/drop'
+```
+
+Port `9502` controls the secondary input loss injector. Use this for tests where
+the primary remains healthy and the tool should continue preferring primary
+without increasing recovery counters.
+
 Healthy baseline expectations:
 
 - `health=[healthy,healthy]` after both streams are stable
