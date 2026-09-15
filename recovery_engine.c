@@ -4,6 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define FAILOVER_ALIGNMENT_MIN_INFORMATIVE_PACKETS 128U
+#define FAILOVER_ALIGNMENT_MAX_CANDIDATES 32768U
+#define ALIGNMENT_STREAM_INDEX_SEARCH_PACKETS 64
+#define ALIGNMENT_PCR_INDEX_SEARCH_PACKETS 2048
+#define RECOVERY_INDEX_START_SEARCH_PACKETS 1024U
+
 static uint64_t hash_packet(const uint8_t packet[TS_PACKET_SIZE])
 {
     uint64_t hash = 1469598103934665603ULL;
@@ -240,7 +246,7 @@ static bool record_fits_next_output(recovery_engine_t *engine, const packet_reco
     if (record->is_null) {
         return true;
     }
-    if (record->transport_error || record->discontinuity_indicator || !record->has_payload) {
+    if (record->transport_error || record->discontinuity_indicator) {
         return false;
     }
 
@@ -249,8 +255,115 @@ static bool record_fits_next_output(recovery_engine_t *engine, const packet_reco
         return true;
     }
 
+    if (!record->has_payload) {
+        return record->continuity_counter == state->continuity_counter;
+    }
+
     expected = (uint8_t)((state->continuity_counter + 1U) & 0x0fU);
     return record->continuity_counter == expected;
+}
+
+static bool record_fits_output_states(const output_pid_state_t states[REPORT_STATS_PIDS],
+                                      const packet_record_t *record)
+{
+    const output_pid_state_t *state;
+    uint8_t expected;
+
+    if (record->is_null) {
+        return true;
+    }
+    if (record->transport_error || record->discontinuity_indicator) {
+        return false;
+    }
+
+    state = &states[record->pid];
+    if (!state->valid) {
+        return true;
+    }
+
+    if (!record->has_payload) {
+        return record->continuity_counter == state->continuity_counter;
+    }
+
+    expected = (uint8_t)((state->continuity_counter + 1U) & 0x0fU);
+    return record->continuity_counter == expected;
+}
+
+static void observe_output_states(output_pid_state_t states[REPORT_STATS_PIDS],
+                                  const packet_record_t *record)
+{
+    output_pid_state_t *state;
+
+    if (record->is_null || record->transport_error || record->discontinuity_indicator) {
+        return;
+    }
+
+    state = &states[record->pid];
+    state->valid = true;
+    state->continuity_counter = record->continuity_counter;
+    state->last_arrival_time_ns = record->arrival_time_ns;
+    if (record->source_stream_id == 0) {
+        state->last_primary_continuity_errors = record->stream_continuity_errors;
+    }
+}
+
+static packet_record_t *delay_queue_get(primary_delay_queue_t *queue, size_t offset)
+{
+    if (offset >= queue->count) {
+        return NULL;
+    }
+    return &queue->records[(queue->start + offset) % queue->capacity];
+}
+
+static bool delay_queue_run_fits_output(recovery_engine_t *engine,
+                                        primary_delay_queue_t *queue,
+                                        size_t start_offset)
+{
+    output_pid_state_t states[REPORT_STATS_PIDS];
+    size_t informative = 0;
+    size_t offset;
+
+    memcpy(states, engine->output_pid_state, sizeof(states));
+    for (offset = start_offset; offset < queue->count; offset++) {
+        packet_record_t *record = delay_queue_get(queue, offset);
+
+        if (record == NULL) {
+            break;
+        }
+        if (!record_fits_output_states(states, record)) {
+            return false;
+        }
+        observe_output_states(states, record);
+        if (record_is_informative(record)) {
+            informative++;
+            if (informative >= FAILOVER_ALIGNMENT_MIN_INFORMATIVE_PACKETS) {
+                return true;
+            }
+        }
+    }
+
+    return informative > 0 && start_offset == 0;
+}
+
+static bool align_delay_queue_to_output(recovery_engine_t *engine, primary_delay_queue_t *queue)
+{
+    size_t limit = queue->count < FAILOVER_ALIGNMENT_MAX_CANDIDATES
+                       ? queue->count
+                       : FAILOVER_ALIGNMENT_MAX_CANDIDATES;
+    size_t offset;
+
+    for (offset = 0; offset < limit; offset++) {
+        if (delay_queue_run_fits_output(engine, queue, offset)) {
+            while (offset > 0) {
+                primary_delay_queue_pop(queue);
+                offset--;
+            }
+            return true;
+        }
+    }
+
+    report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
+    return false;
 }
 
 static uint64_t packet_info_pcr_value(const ts_packet_info_t *info)
@@ -464,6 +577,14 @@ static int score_alignment_match(const packet_record_t *record, const packet_rec
     }
     if (record->has_pcr && candidate->has_pcr) {
         score += 2;
+        if (record->pid == candidate->pid) {
+            int64_t delta = signed_pcr_delta(record->pcr_value, candidate->pcr_value);
+            uint64_t abs_delta = delta >= 0 ? (uint64_t)delta : (uint64_t)-delta;
+
+            if (abs_delta <= 27U) {
+                score += 8;
+            }
+        }
     }
 
     return score;
@@ -604,6 +725,34 @@ static int64_t estimated_secondary_time_offset_ns(recovery_engine_t *engine)
     return 0;
 }
 
+static bool estimated_alignment_offset_packets(recovery_engine_t *engine, int64_t *offset_packets)
+{
+    double bitrate_bps;
+    double packets_per_second;
+    double offset;
+
+    if (engine->alignment.has_alignment) {
+        *offset_packets = engine->alignment.offset_packets;
+        return true;
+    }
+    if (engine->stats->pcr_timing_confidence[0] < 70U ||
+        engine->stats->pcr_timing_confidence[1] < 70U) {
+        return false;
+    }
+
+    bitrate_bps = engine->stats->pcr_bitrate_bps[0] > 0.0
+                      ? engine->stats->pcr_bitrate_bps[0]
+                      : engine->stats->pcr_bitrate_bps[1];
+    if (bitrate_bps <= 0.0) {
+        return false;
+    }
+
+    packets_per_second = bitrate_bps / ((double)TS_PACKET_SIZE * 8.0);
+    offset = (engine->stats->pcr_delay_ns / 1000000000.0) * packets_per_second;
+    *offset_packets = offset >= 0.0 ? (int64_t)(offset + 0.5) : (int64_t)(offset - 0.5);
+    return true;
+}
+
 static uint64_t apply_time_offset(uint64_t value, int64_t offset)
 {
     if (offset < 0) {
@@ -612,20 +761,6 @@ static uint64_t apply_time_offset(uint64_t value, int64_t offset)
     }
 
     return value + (uint64_t)offset;
-}
-
-static uint64_t secondary_release_delay_ns(recovery_engine_t *engine)
-{
-    int64_t observed_latency_ns = estimated_secondary_time_offset_ns(engine);
-    uint64_t latency_ns = 0;
-
-    if (observed_latency_ns > 0) {
-        latency_ns = (uint64_t)observed_latency_ns;
-    }
-    if (latency_ns >= engine->config.primary_delay_ns) {
-        return 0;
-    }
-    return engine->config.primary_delay_ns - latency_ns;
 }
 
 static void set_active_output_stream(recovery_engine_t *engine, int stream_id)
@@ -675,6 +810,74 @@ static bool primary_record_already_covered_by_secondary(recovery_engine_t *engin
     return (uint64_t)secondary_index <= engine->last_output_stream_index[1];
 }
 
+static packet_record_t *find_recent_secondary_match_for_primary(recovery_engine_t *engine,
+                                                                const packet_record_t *primary)
+{
+    packet_history_t *secondary = &engine->history[1];
+    size_t limit = secondary->count < FAILOVER_ALIGNMENT_MAX_CANDIDATES
+                       ? secondary->count
+                       : FAILOVER_ALIGNMENT_MAX_CANDIDATES;
+    size_t age;
+
+    if (!engine->has_output_stream_index[1] || !record_is_informative(primary)) {
+        return NULL;
+    }
+
+    for (age = 0; age < limit; age++) {
+        packet_record_t *candidate = packet_history_get_newest(secondary, age);
+
+        if (candidate == NULL) {
+            break;
+        }
+        if (candidate->hash == primary->hash &&
+            score_alignment_match(primary, candidate) >= RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD &&
+            records_within_alignment_window(engine, primary, candidate)) {
+            return candidate;
+        }
+    }
+
+    return NULL;
+}
+
+static bool align_primary_queue_for_switchback(recovery_engine_t *engine)
+{
+    size_t limit = engine->primary_queue.count < FAILOVER_ALIGNMENT_MAX_CANDIDATES
+                       ? engine->primary_queue.count
+                       : FAILOVER_ALIGNMENT_MAX_CANDIDATES;
+    size_t offset;
+
+    for (offset = 0; offset < limit; offset++) {
+        packet_record_t *record = delay_queue_get(&engine->primary_queue, offset);
+        packet_record_t *match;
+
+        if (record == NULL || !delay_queue_run_fits_output(engine, &engine->primary_queue, offset)) {
+            continue;
+        }
+
+        match = find_recent_secondary_match_for_primary(engine, record);
+        if (match == NULL) {
+            continue;
+        }
+
+        while (offset > 0) {
+            primary_delay_queue_pop(&engine->primary_queue);
+            offset--;
+        }
+        engine->alignment.has_alignment = true;
+        engine->alignment.offset_packets = (int64_t)match->stream_index - (int64_t)record->stream_index;
+        if (engine->alignment.confidence < engine->config.min_alignment_confidence) {
+            engine->alignment.confidence = engine->config.min_alignment_confidence;
+        }
+        engine->stats->alignment_offset_packets = engine->alignment.offset_packets;
+        engine->stats->alignment_confidence = engine->alignment.confidence;
+        return true;
+    }
+
+    report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
+    return engine->config.primary_delay_ns == 0 &&
+           align_delay_queue_to_output(engine, &engine->primary_queue);
+}
+
 static void prune_primary_queue_covered_by_secondary(recovery_engine_t *engine)
 {
     while (engine->primary_queue.count > 0) {
@@ -689,17 +892,6 @@ static void prune_primary_queue_covered_by_secondary(recovery_engine_t *engine)
             break;
         }
         primary_delay_queue_pop(&engine->primary_queue);
-    }
-}
-
-static void prune_queue_until_next_output(recovery_engine_t *engine, primary_delay_queue_t *queue)
-{
-    while (queue->count > 0) {
-        packet_record_t *record = primary_delay_queue_front(queue);
-        if (record == NULL || record_fits_next_output(engine, record)) {
-            break;
-        }
-        primary_delay_queue_pop(queue);
     }
 }
 
@@ -733,10 +925,12 @@ static bool failover_is_allowed(recovery_engine_t *engine)
     if (engine->secondary_queue.count == 0) {
         return false;
     }
-    if (!engine->alignment.has_alignment) {
-        return false;
+    if (engine->alignment.has_alignment &&
+        engine->alignment.confidence >= engine->config.min_alignment_confidence / 2U) {
+        return true;
     }
-    return engine->alignment.confidence >= engine->config.min_alignment_confidence / 2U;
+    return engine->stats->pcr_timing_confidence[0] >= 70U &&
+           engine->stats->pcr_timing_confidence[1] >= 70U;
 }
 
 static void maybe_update_active_source(recovery_engine_t *engine, uint64_t now_ns)
@@ -749,8 +943,9 @@ static void maybe_update_active_source(recovery_engine_t *engine, uint64_t now_n
             if (engine->last_primary_anchor.valid) {
                 prune_secondary_queue_through(engine, engine->last_primary_anchor.secondary_index);
             }
-            prune_queue_until_next_output(engine, &engine->secondary_queue);
-            set_active_output_stream(engine, 1);
+            if (align_delay_queue_to_output(engine, &engine->secondary_queue)) {
+                set_active_output_stream(engine, 1);
+            }
         }
         return;
     }
@@ -758,8 +953,7 @@ static void maybe_update_active_source(recovery_engine_t *engine, uint64_t now_n
     prune_primary_queue_covered_by_secondary(engine);
     if (!secondary_recent && engine->primary_queue.count > 0) {
         prune_due_primary_backlog(engine, now_ns);
-        prune_queue_until_next_output(engine, &engine->primary_queue);
-        if (engine->primary_queue.count == 0) {
+        if (!align_delay_queue_to_output(engine, &engine->primary_queue)) {
             return;
         }
         set_active_output_stream(engine, 0);
@@ -776,8 +970,7 @@ static void maybe_update_active_source(recovery_engine_t *engine, uint64_t now_n
     }
     if (now_ns - engine->primary_return_start_ns >= engine->config.primary_return_ns) {
         prune_due_primary_backlog(engine, now_ns);
-        prune_queue_until_next_output(engine, &engine->primary_queue);
-        if (engine->primary_queue.count > 0) {
+        if (align_primary_queue_for_switchback(engine)) {
             set_active_output_stream(engine, 0);
         }
     }
@@ -785,8 +978,7 @@ static void maybe_update_active_source(recovery_engine_t *engine, uint64_t now_n
 
 static int drain_secondary_failover(recovery_engine_t *engine, bool force)
 {
-    uint64_t now_ns = report_stats_now_ns();
-    uint64_t release_delay_ns = secondary_release_delay_ns(engine);
+    (void)force;
 
     while (engine->secondary_queue.count > 0) {
         packet_record_t *record = primary_delay_queue_front(&engine->secondary_queue);
@@ -798,9 +990,6 @@ static int drain_secondary_failover(recovery_engine_t *engine, bool force)
             record->stream_index <= engine->last_primary_anchor.secondary_index) {
             primary_delay_queue_pop(&engine->secondary_queue);
             continue;
-        }
-        if (!force && now_ns - record->arrival_time_ns < release_delay_ns) {
-            break;
         }
         if (!record_fits_next_output(engine, record)) {
             primary_delay_queue_pop(&engine->secondary_queue);
@@ -905,6 +1094,136 @@ static int recover_secondary_time_range(recovery_engine_t *engine,
     return (int)recovered;
 }
 
+static int recover_secondary_index_deficit(recovery_engine_t *engine,
+                                           const packet_record_t *primary,
+                                           uint64_t max_recover,
+                                           bool null_only)
+{
+    uint64_t start_index;
+    uint64_t recovered = 0;
+    uint64_t recovered_content = 0;
+    uint64_t scanned;
+
+    if (!engine->last_primary_anchor.valid || max_recover == 0) {
+        return 0;
+    }
+
+    start_index = engine->last_primary_anchor.secondary_index + 1ULL +
+                  engine->primary_gap.recovered_stream_packets;
+    if (engine->has_output_stream_index[0] &&
+        engine->last_output_stream_index[0] > engine->last_primary_anchor.primary_index) {
+        start_index += engine->last_output_stream_index[0] -
+                       engine->last_primary_anchor.primary_index;
+    }
+    for (scanned = 0; scanned < max_recover; scanned++) {
+        uint64_t index = start_index + scanned;
+        packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
+
+        if (candidate == NULL) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_MISSING_CANDIDATE);
+            break;
+        }
+        if (primary != NULL && candidate->hash == primary->hash) {
+            break;
+        }
+        if (candidate->transport_error) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_TEI);
+            break;
+        }
+        if (candidate->discontinuity_indicator) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_DISCONTINUITY);
+            break;
+        }
+        if (null_only && !candidate->is_null) {
+            break;
+        }
+        if (!record_fits_next_output(engine, candidate)) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
+            if (recovered == 0 && scanned + 1U < max_recover &&
+                scanned < RECOVERY_INDEX_START_SEARCH_PACKETS) {
+                continue;
+            }
+            break;
+        }
+        if (output_record(engine, candidate) != 0) {
+            return -1;
+        }
+        report_stats_observe_recovery(engine->stats, candidate->is_null);
+        if (!candidate->is_null) {
+            recovered_content++;
+        }
+        engine->primary_gap.last_recovered_secondary_arrival_ns = candidate->arrival_time_ns;
+        recovered++;
+    }
+
+    if (recovered_content > 1) {
+        engine->stats->recovered_content_bursts++;
+    }
+
+    return (int)recovered;
+}
+
+static int recover_secondary_bridge_to_primary(recovery_engine_t *engine,
+                                               const packet_record_t *primary,
+                                               uint64_t max_recover)
+{
+    packet_history_t *secondary = &engine->history[1];
+    int64_t offset_ns = estimated_secondary_time_offset_ns(engine);
+    uint64_t start_arrival_ns = engine->primary_gap.last_recovered_secondary_arrival_ns;
+    uint64_t recovered = 0;
+    uint64_t recovered_content = 0;
+    size_t i;
+
+    if (start_arrival_ns == 0 && engine->primary_gap.valid) {
+        start_arrival_ns = apply_time_offset(engine->primary_gap.arrival_time_ns, offset_ns);
+        if (start_arrival_ns >= RECOVERY_ENGINE_STREAM_GAP_TIME_MARGIN_NS) {
+            start_arrival_ns -= RECOVERY_ENGINE_STREAM_GAP_TIME_MARGIN_NS;
+        }
+    }
+
+    for (i = 0; i < secondary->count; i++) {
+        size_t index = (secondary->start + i) % secondary->capacity;
+        packet_record_t *candidate = &secondary->records[index];
+
+        if (candidate->arrival_time_ns <= start_arrival_ns) {
+            continue;
+        }
+        if (candidate->hash == primary->hash) {
+            break;
+        }
+        if (recovered >= max_recover) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_BURST_TOO_LARGE);
+            break;
+        }
+        if (candidate->transport_error) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_TEI);
+            break;
+        }
+        if (candidate->discontinuity_indicator) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_DISCONTINUITY);
+            break;
+        }
+        if (!record_fits_next_output(engine, candidate)) {
+            continue;
+        }
+        if (output_record(engine, candidate) != 0) {
+            return -1;
+        }
+        report_stats_observe_recovery(engine->stats, candidate->is_null);
+        if (!candidate->is_null) {
+            recovered_content++;
+        }
+        engine->primary_gap.last_recovered_secondary_arrival_ns = candidate->arrival_time_ns;
+        recovered++;
+    }
+
+    if (recovered_content > 1) {
+        engine->stats->recovered_content_bursts++;
+    }
+
+    return (int)recovered;
+}
+
 static int recover_stream_gap_before_primary(recovery_engine_t *engine,
                                              const packet_record_t *primary)
 {
@@ -935,10 +1254,31 @@ static int recover_stream_gap_before_primary(recovery_engine_t *engine,
         return 0;
     }
     max_recover = stream_deficit - engine->primary_gap.recovered_stream_packets;
-    content_gap = primary->stream_continuity_errors > engine->primary_gap.continuity_errors;
+    content_gap = primary->stream_continuity_errors > engine->primary_gap.continuity_errors ||
+                  primary->stream_duplicate_counters > engine->primary_gap.duplicate_counters;
+    if (content_gap && max_recover > 255U && !engine->last_primary_anchor.valid &&
+        (!engine->alignment.has_alignment ||
+         engine->alignment.confidence < engine->config.min_alignment_confidence / 2U)) {
+        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_BURST_TOO_LARGE);
+        return 0;
+    }
     null_only = !content_gap;
     if (null_only && max_recover < RECOVERY_ENGINE_MIN_NULL_GAP_RECOVERY_PACKETS) {
         return 0;
+    }
+
+    if (max_recover > 255U) {
+        recovered = recover_secondary_index_deficit(engine, primary, max_recover, null_only);
+        if (recovered < 0) {
+            return -1;
+        }
+        if (recovered > 0) {
+            engine->primary_gap.recovered_stream_packets += (uint64_t)recovered;
+            max_recover -= (uint64_t)recovered;
+            if (max_recover == 0) {
+                return 0;
+            }
+        }
     }
 
     offset_ns = estimated_secondary_time_offset_ns(engine);
@@ -1301,6 +1641,7 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
     packet_history_t *other_history;
     packet_record_t *best = NULL;
     int best_score = 0;
+    int64_t delta;
     size_t limit;
     size_t age;
 
@@ -1309,6 +1650,56 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
     }
 
     other_history = &engine->history[stream_id == 0 ? 1 : 0];
+    for (delta = -ALIGNMENT_STREAM_INDEX_SEARCH_PACKETS;
+         delta <= ALIGNMENT_STREAM_INDEX_SEARCH_PACKETS; delta++) {
+        int64_t candidate_index = (int64_t)record->stream_index + delta;
+        packet_record_t *candidate;
+        int score;
+
+        if (candidate_index < 0) {
+            continue;
+        }
+        candidate = packet_history_find_index(other_history, (uint64_t)candidate_index);
+        if (candidate == NULL || !records_within_alignment_window(engine, record, candidate)) {
+            continue;
+        }
+        score = score_alignment_match(record, candidate);
+        if (score > best_score) {
+            best_score = score;
+            best = candidate;
+        }
+    }
+
+    if (best_score < RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
+        int64_t offset_packets;
+
+        if (estimated_alignment_offset_packets(engine, &offset_packets)) {
+            int64_t expected_index = stream_id == 0
+                                         ? (int64_t)record->stream_index + offset_packets
+                                         : (int64_t)record->stream_index - offset_packets;
+
+            for (delta = -ALIGNMENT_PCR_INDEX_SEARCH_PACKETS;
+                 delta <= ALIGNMENT_PCR_INDEX_SEARCH_PACKETS; delta++) {
+                int64_t candidate_index = expected_index + delta;
+                packet_record_t *candidate;
+                int score;
+
+                if (candidate_index < 0) {
+                    continue;
+                }
+                candidate = packet_history_find_index(other_history, (uint64_t)candidate_index);
+                if (candidate == NULL || !records_within_alignment_window(engine, record, candidate)) {
+                    continue;
+                }
+                score = score_alignment_match(record, candidate);
+                if (score > best_score) {
+                    best_score = score;
+                    best = candidate;
+                }
+            }
+        }
+    }
+
     limit = other_history->count < RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS
                 ? other_history->count
                 : RECOVERY_ENGINE_ALIGNMENT_SEARCH_PACKETS;
@@ -1344,8 +1735,13 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
         if (engine->alignment.has_alignment &&
             llabs(offset - engine->alignment.offset_packets) > 4) {
             engine->stats->stream_disagreements++;
-            if (engine->alignment.confidence > 5) {
-                engine->alignment.confidence -= 5;
+            if (stream_id == 0 &&
+                (record->stream_continuity_errors > engine->primary_gap.continuity_errors ||
+                 record->stream_duplicate_counters > engine->primary_gap.duplicate_counters)) {
+                engine->alignment.consecutive_misses++;
+                engine->stats->alignment_offset_packets = engine->alignment.offset_packets;
+                engine->stats->alignment_confidence = engine->alignment.confidence;
+                return;
             }
         } else if (engine->alignment.confidence < 100) {
             engine->alignment.confidence += 4;
@@ -1481,6 +1877,7 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
     record->transport_error = info->transport_error;
     record->discontinuity_indicator = info->discontinuity_indicator;
     record->stream_continuity_errors = engine->stats->continuity_errors[stream_id];
+    record->stream_duplicate_counters = engine->stats->duplicate_counters[stream_id];
     record->pcr_value = info->has_pcr ? packet_info_pcr_value(info) : 0;
     record->hash = hash_packet(packet);
     memcpy(record->packet, packet, TS_PACKET_SIZE);
@@ -1523,6 +1920,7 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         uint64_t now_ns = report_stats_now_ns();
         packet_record_t *record = primary_delay_queue_front(&engine->primary_queue);
         packet_record_t *secondary_match;
+        uint64_t recovered_before = engine->stats->recovered_packets;
 
         if (!force && now_ns - record->arrival_time_ns < engine->primary_queue.delay_ns) {
             break;
@@ -1547,7 +1945,20 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 
         diagnose_secondary_loss_before_primary(engine, record, secondary_match);
 
-        if (engine->primary_switchback_guard &&
+        if (engine->stats->recovered_packets > recovered_before &&
+            !record_fits_next_output(engine, record)) {
+            int bridge_recovered = recover_secondary_bridge_to_primary(
+                engine, record, RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS);
+
+            if (bridge_recovered < 0) {
+                return -1;
+            }
+        }
+
+        if ((engine->primary_switchback_guard ||
+             engine->stats->recovered_packets > recovered_before ||
+             record->stream_continuity_errors > engine->primary_gap.continuity_errors ||
+             record->stream_duplicate_counters > engine->primary_gap.duplicate_counters) &&
             !record_fits_next_output(engine, record)) {
             report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
             engine->stats->unrecoverable_loss++;
@@ -1561,6 +1972,9 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         engine->primary_gap.valid = true;
         engine->primary_gap.arrival_time_ns = record->arrival_time_ns;
         engine->primary_gap.continuity_errors = record->stream_continuity_errors;
+        engine->primary_gap.duplicate_counters = record->stream_duplicate_counters;
+        engine->primary_gap.recovered_stream_packets = 0;
+        engine->primary_gap.last_recovered_secondary_arrival_ns = 0;
         if (secondary_match != NULL) {
             engine->last_primary_anchor.valid = true;
             engine->last_primary_anchor.primary_index = record->stream_index;

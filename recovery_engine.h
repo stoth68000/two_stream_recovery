@@ -59,6 +59,7 @@ typedef struct primary_gap_state {
     uint64_t last_recovered_secondary_arrival_ns;
     uint64_t recovered_stream_packets;
     uint64_t continuity_errors;
+    uint64_t duplicate_counters;
 } primary_gap_state_t;
 
 typedef struct output_pid_state {
@@ -81,6 +82,7 @@ typedef struct packet_record {
     bool transport_error;
     bool discontinuity_indicator;
     uint64_t stream_continuity_errors;
+    uint64_t stream_duplicate_counters;
     uint64_t pcr_value;
     uint64_t hash;
     uint8_t packet[TS_PACKET_SIZE];

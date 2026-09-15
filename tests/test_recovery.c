@@ -978,6 +978,72 @@ static void test_stream_time_range_recovers_null_only_gap(void)
     recovery_engine_free(&engine);
 }
 
+static void test_primary_index_gap_recovers_with_stale_alignment_confidence(void)
+{
+    enum {
+        OFFSET = 8,
+        WARMUP_PACKETS = 12,
+        GAP_PACKETS = 20
+    };
+    const uint64_t base_ns = 5000000000ULL;
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t secondary_gap[GAP_PACKETS][TS_PACKET_SIZE];
+    uint8_t primary_after[TS_PACKET_SIZE];
+    uint8_t secondary_after[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.config.min_alignment_confidence = 80;
+
+    for (i = 0; i < OFFSET; i++) {
+        uint8_t prelude[TS_PACKET_SIZE];
+
+        make_packet(prelude, (uint16_t)(0x0700 + i), (uint8_t)i, (uint8_t)(0x20 + i));
+        push_packet(&engine, &stats, 1, prelude);
+    }
+    for (i = 0; i < WARMUP_PACKETS; i++) {
+        uint8_t packet[TS_PACKET_SIZE];
+
+        make_packet(packet, 0x124, (uint8_t)i, (uint8_t)(0x50 + i));
+        push_packet(&engine, &stats, 0, packet);
+        push_packet(&engine, &stats, 1, packet);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(engine.last_primary_anchor.valid);
+    engine.primary_gap.arrival_time_ns = base_ns;
+
+    engine.alignment.confidence = 0;
+    for (i = 0; i < GAP_PACKETS; i++) {
+        make_packet(secondary_gap[i], 0x124, (uint8_t)((WARMUP_PACKETS + i) & 0x0fU),
+                    (uint8_t)(0x70 + i));
+        push_packet(&engine, &stats, 1, secondary_gap[i]);
+    }
+
+    make_packet(primary_after, 0x124, (uint8_t)((WARMUP_PACKETS + GAP_PACKETS) & 0x0fU), 0xa0);
+    make_packet(secondary_after, 0x124, (uint8_t)((WARMUP_PACKETS + GAP_PACKETS) & 0x0fU), 0xa0);
+    push_packet(&engine, &stats, 1, secondary_after);
+    push_packet(&engine, &stats, 0, primary_after);
+    assert(engine.primary_queue.count == 1);
+    engine.primary_queue.records[engine.primary_queue.start].arrival_time_ns =
+        base_ns + 2000000000ULL;
+    engine.next_stream_index[1] = engine.next_stream_index[0] + 300ULL;
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == WARMUP_PACKETS + GAP_PACKETS + 1);
+    for (i = 0; i < GAP_PACKETS; i++) {
+        assert(memcmp(capture.packets[WARMUP_PACKETS + i], secondary_gap[i], TS_PACKET_SIZE) == 0);
+    }
+    assert(memcmp(capture.packets[WARMUP_PACKETS + GAP_PACKETS], primary_after, TS_PACKET_SIZE) == 0);
+    assert(stats.recovered_packets == GAP_PACKETS);
+    assert(stats.recovered_content_packets == GAP_PACKETS);
+    assert(stats.unrecoverable_loss == 0);
+    assert(stats.output_continuity_errors == 0);
+    recovery_engine_free(&engine);
+}
+
 static void test_pid_time_range_recovery_wrap_gap(void)
 {
     enum {
@@ -1175,11 +1241,11 @@ static void test_generated_ambiguous_recovery_sweep(void)
             push_packet(&engine, &stats, 1, secondary_anchor);
 
             assert(recovery_engine_flush(&engine) == 0);
-            assert(capture.packet_count == 13);
-            assert(memcmp(capture.packets[12], primary_anchor, TS_PACKET_SIZE) == 0);
+            assert(capture.packet_count == 12);
             assert(stats.recovered_content_packets == 0);
             assert(stats.recovered_packets == 0);
             assert(stats.unrecoverable_loss >= 1);
+            assert(stats.output_continuity_errors == 0);
             recovery_engine_free(&engine);
             scenarios++;
         }
@@ -1573,6 +1639,7 @@ int main(void)
     test_stream_time_range_recovery();
     test_stream_time_range_skips_primary_boundary_twin();
     test_stream_time_range_recovers_null_only_gap();
+    test_primary_index_gap_recovers_with_stale_alignment_confidence();
     test_pid_time_range_recovery_wrap_gap();
     test_secondary_loss_diagnosis();
     test_generated_parser_sweep();
