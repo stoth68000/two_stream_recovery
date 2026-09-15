@@ -43,5 +43,5 @@ live-test: $(BIN)
 		--alignment-window-ms 6000 \
 		--history-ms 10000 \
 		--max-content-burst-packets 255 \
-		--http-port 4500 \
-		--console-report
+		--http-port 4500
+#--console-report

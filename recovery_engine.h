@@ -72,6 +72,11 @@ typedef struct output_pid_state {
     uint64_t last_primary_continuity_errors;
 } output_pid_state_t;
 
+typedef struct input_pid_state {
+    bool valid;
+    uint8_t continuity_counter;
+} input_pid_state_t;
+
 typedef struct packet_record {
     int source_stream_id;
     uint64_t stream_index;
@@ -143,6 +148,7 @@ typedef struct recovery_engine {
     alignment_state_t alignment;
     primary_anchor_t last_primary_anchor;
     primary_gap_state_t primary_gap;
+    input_pid_state_t input_pid_state[REPORT_STATS_STREAMS][REPORT_STATS_PIDS];
     output_pid_state_t output_pid_state[REPORT_STATS_PIDS];
 } recovery_engine_t;
 
