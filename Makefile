@@ -43,7 +43,7 @@ live-test: $(BIN)
 		--max-secondary-latency-ms 5000 \
 		--alignment-window-ms 6000 \
 		--history-ms 12000 \
-		--primary-outage-ms 500 \
+		--primary-outage-ms 50 \
 		--primary-return-ms 120000 \
 		--max-content-burst-packets 255 \
 		--min-alignment-confidence 0 \

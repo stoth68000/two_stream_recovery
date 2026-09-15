@@ -796,6 +796,145 @@ static void test_secondary_outage_keeps_primary_output(void)
     recovery_engine_free(&engine);
 }
 
+static void test_primary_overflow_does_not_emit_while_failed_over(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t oldest[TS_PACKET_SIZE];
+    uint8_t incoming[TS_PACKET_SIZE];
+
+    config.primary_delay_ns = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    make_packet(oldest, 0x131, 0, 0x50);
+    make_packet(incoming, 0x131, 1, 0x51);
+    engine.active_output_stream_id = 1;
+    stats.active_output_stream_id = 1;
+    engine.last_input_arrival_ns[1] = report_stats_now_ns();
+    engine.primary_queue.count = engine.primary_queue.capacity;
+    memcpy(engine.primary_queue.records[engine.primary_queue.start].packet, oldest, TS_PACKET_SIZE);
+
+    push_packet(&engine, &stats, 0, incoming);
+
+    assert(capture.packet_count == 0);
+    assert(stats.primary_delay_overflows == 1);
+    assert(engine.primary_queue.count == engine.primary_queue.capacity);
+
+    recovery_engine_free(&engine);
+}
+
+static void test_due_secondary_fills_primary_stall_before_primary_returns(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t primary_anchor[TS_PACKET_SIZE];
+    uint8_t secondary_repair[TS_PACKET_SIZE];
+    uint8_t primary_after[TS_PACKET_SIZE];
+    uint64_t now_ns;
+    size_t secondary_queue_index;
+    size_t secondary_history_index;
+
+    config.primary_delay_ns = 0;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    make_packet(primary_anchor, 0x132, 0, 0x60);
+    push_packet(&engine, &stats, 1, primary_anchor);
+    push_packet(&engine, &stats, 0, primary_anchor);
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(engine.last_primary_anchor.valid);
+    assert(capture.packet_count == 1);
+
+    engine.config.primary_delay_ns = 1000000000ULL;
+    engine.primary_queue.delay_ns = 1000000000ULL;
+    engine.secondary_queue.delay_ns = 1000000000ULL;
+    stats.observed_secondary_latency_samples = 1;
+    stats.observed_secondary_latency_avg_ns = 500000000.0;
+
+    make_packet(secondary_repair, 0x132, 1, 0x61);
+    push_packet(&engine, &stats, 1, secondary_repair);
+    make_packet(primary_after, 0x132, 2, 0x62);
+    push_packet(&engine, &stats, 0, primary_after);
+
+    now_ns = report_stats_now_ns();
+    secondary_queue_index = (engine.secondary_queue.start + engine.secondary_queue.count - 1U) %
+                            engine.secondary_queue.capacity;
+    secondary_history_index = (engine.history[1].start + engine.history[1].count - 1U) %
+                              engine.history[1].capacity;
+    engine.secondary_queue.records[secondary_queue_index].arrival_time_ns = now_ns - 600000000ULL;
+    engine.history[1].records[secondary_history_index].arrival_time_ns = now_ns - 600000000ULL;
+    engine.primary_queue.records[engine.primary_queue.start].arrival_time_ns = now_ns;
+
+    assert(recovery_engine_drain(&engine, false) == 0);
+    assert(capture.packet_count == 2);
+    assert(memcmp(capture.packets[1], secondary_repair, TS_PACKET_SIZE) == 0);
+    assert(stats.recovered_packets == 1);
+    assert(stats.output_continuity_errors == 0);
+
+    recovery_engine_free(&engine);
+}
+
+static void test_due_secondary_fills_empty_primary_stall(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t primary_anchor[TS_PACKET_SIZE];
+    uint8_t secondary_repair[TS_PACKET_SIZE];
+    uint64_t now_ns;
+    size_t secondary_queue_index;
+    size_t secondary_history_index;
+
+    config.primary_delay_ns = 0;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    make_packet(primary_anchor, 0x133, 0, 0x70);
+    push_packet(&engine, &stats, 1, primary_anchor);
+    push_packet(&engine, &stats, 0, primary_anchor);
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(engine.last_primary_anchor.valid);
+    assert(capture.packet_count == 1);
+
+    engine.config.primary_delay_ns = 1000000000ULL;
+    engine.primary_queue.delay_ns = 1000000000ULL;
+    engine.secondary_queue.delay_ns = 1000000000ULL;
+    stats.observed_secondary_latency_samples = 1;
+    stats.observed_secondary_latency_avg_ns = 0.0;
+    stats.pcr_timing_confidence[0] = 100;
+    stats.pcr_timing_confidence[1] = 100;
+    stats.pcr_delay_ns = -500000000.0;
+
+    make_packet(secondary_repair, 0x133, 1, 0x71);
+    push_packet(&engine, &stats, 1, secondary_repair);
+
+    now_ns = report_stats_now_ns();
+    secondary_queue_index = (engine.secondary_queue.start + engine.secondary_queue.count - 1U) %
+                            engine.secondary_queue.capacity;
+    secondary_history_index = (engine.history[1].start + engine.history[1].count - 1U) %
+                              engine.history[1].capacity;
+    engine.secondary_queue.records[secondary_queue_index].arrival_time_ns = now_ns - 600000000ULL;
+    engine.history[1].records[secondary_history_index].arrival_time_ns = now_ns - 600000000ULL;
+    engine.last_input_arrival_ns[0] = now_ns - RECOVERY_ENGINE_STREAM_GAP_MIN_NS;
+    engine.last_input_arrival_ns[1] = now_ns;
+
+    assert(recovery_engine_drain(&engine, false) == 0);
+    assert(capture.packet_count == 2);
+    assert(memcmp(capture.packets[1], secondary_repair, TS_PACKET_SIZE) == 0);
+    assert(stats.recovered_packets == 1);
+    assert(stats.output_continuity_errors == 0);
+
+    recovery_engine_free(&engine);
+}
+
 static void test_counter_fallback_recovery_without_anchor(void)
 {
     recovery_engine_t engine;
@@ -1671,6 +1810,9 @@ int main(void)
     test_primary_return_switches_back_after_holdoff();
     test_primary_switchback_guard_survives_null_until_informative_fit();
     test_secondary_outage_keeps_primary_output();
+    test_primary_overflow_does_not_emit_while_failed_over();
+    test_due_secondary_fills_primary_stall_before_primary_returns();
+    test_due_secondary_fills_empty_primary_stall();
     test_counter_fallback_recovery_without_anchor();
     test_stream_time_range_recovery();
     test_stream_time_range_skips_primary_boundary_twin();

@@ -17,7 +17,7 @@
 #define RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS 6000000000ULL
 #define RECOVERY_ENGINE_DEFAULT_HISTORY_MS 6000ULL
 #define RECOVERY_ENGINE_DEFAULT_MIN_ALIGNMENT_CONFIDENCE 40U
-#define RECOVERY_ENGINE_DEFAULT_PRIMARY_OUTAGE_NS 500000000ULL
+#define RECOVERY_ENGINE_DEFAULT_PRIMARY_OUTAGE_NS 50000000ULL
 #define RECOVERY_ENGINE_DEFAULT_PRIMARY_RETURN_NS 120000000000ULL
 #define RECOVERY_ENGINE_MAX_PCR_PIDS 32
 #define RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS 15U
@@ -58,6 +58,7 @@ typedef struct primary_gap_state {
     uint64_t arrival_time_ns;
     uint64_t last_recovered_secondary_arrival_ns;
     uint64_t recovered_stream_packets;
+    uint64_t secondary_recovery_index;
     uint64_t continuity_errors;
     uint64_t duplicate_counters;
 } primary_gap_state_t;
