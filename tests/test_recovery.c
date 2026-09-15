@@ -1171,6 +1171,7 @@ static void test_primary_index_gap_recovers_with_stale_alignment_confidence(void
 
     init_engine(&engine, &stats, &capture, &sink);
     engine.config.min_alignment_confidence = 80;
+    engine.config.max_content_burst_packets = GAP_PACKETS;
 
     for (i = 0; i < OFFSET; i++) {
         uint8_t prelude[TS_PACKET_SIZE];
@@ -1215,6 +1216,66 @@ static void test_primary_index_gap_recovers_with_stale_alignment_confidence(void
     assert(stats.recovered_content_packets == GAP_PACKETS);
     assert(stats.unrecoverable_loss == 0);
     assert(stats.output_continuity_errors == 0);
+    recovery_engine_free(&engine);
+}
+
+static void test_anchor_gap_recovers_counter_wrap_without_primary_cc_error(void)
+{
+    enum {
+        WARMUP_PACKETS = 8,
+        GAP_PACKETS = 16
+    };
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t secondary_gap[GAP_PACKETS][TS_PACKET_SIZE];
+    uint8_t primary_after[TS_PACKET_SIZE];
+    uint8_t secondary_after[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.config.min_alignment_confidence = 80;
+    engine.config.max_content_burst_packets = GAP_PACKETS;
+
+    for (i = 0; i < WARMUP_PACKETS; i++) {
+        uint8_t packet[TS_PACKET_SIZE];
+
+        make_packet(packet, 0x125, (uint8_t)(i & 0x0fU), (uint8_t)(0x30 + i));
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+    engine.alignment.has_alignment = true;
+    engine.alignment.offset_packets = 0;
+    engine.alignment.confidence = 100;
+    engine.last_primary_anchor.valid = true;
+    engine.last_primary_anchor.primary_index = WARMUP_PACKETS - 1ULL;
+    engine.last_primary_anchor.secondary_index = WARMUP_PACKETS - 1ULL;
+
+    for (i = 0; i < GAP_PACKETS; i++) {
+        make_packet(secondary_gap[i], 0x125, (uint8_t)((WARMUP_PACKETS + i) & 0x0fU),
+                    (uint8_t)(0x60 + i));
+        push_packet(&engine, &stats, 1, secondary_gap[i]);
+    }
+
+    make_packet(primary_after, 0x125, (uint8_t)((WARMUP_PACKETS + GAP_PACKETS) & 0x0fU), 0xa0);
+    make_packet(secondary_after, 0x125, (uint8_t)((WARMUP_PACKETS + GAP_PACKETS) & 0x0fU), 0xa0);
+    push_packet(&engine, &stats, 1, secondary_after);
+    push_packet(&engine, &stats, 0, primary_after);
+
+    assert(stats.continuity_errors[0] == 0);
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == WARMUP_PACKETS + GAP_PACKETS + 1);
+    for (i = 0; i < GAP_PACKETS; i++) {
+        assert(memcmp(capture.packets[WARMUP_PACKETS + i], secondary_gap[i], TS_PACKET_SIZE) == 0);
+    }
+    assert(memcmp(capture.packets[WARMUP_PACKETS + GAP_PACKETS], primary_after, TS_PACKET_SIZE) == 0);
+    assert(stats.recovered_packets == GAP_PACKETS);
+    assert(stats.recovered_content_packets == GAP_PACKETS);
+    assert(stats.output_continuity_errors == 0);
+    assert(stats.unrecoverable_loss == 0);
+
     recovery_engine_free(&engine);
 }
 
@@ -1818,6 +1879,7 @@ int main(void)
     test_stream_time_range_skips_primary_boundary_twin();
     test_stream_time_range_recovers_null_only_gap();
     test_primary_index_gap_recovers_with_stale_alignment_confidence();
+    test_anchor_gap_recovers_counter_wrap_without_primary_cc_error();
     test_pid_time_range_recovery_wrap_gap();
     test_secondary_loss_diagnosis();
     test_generated_parser_sweep();

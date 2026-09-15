@@ -624,26 +624,56 @@ static packet_record_t *find_secondary_match_for_primary(recovery_engine_t *engi
     int64_t delta;
     packet_history_t *secondary = &engine->history[1];
 
-    if (!record_is_informative(primary) || !engine->alignment.has_alignment ||
-        engine->alignment.confidence < engine->config.min_alignment_confidence / 2U) {
-        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_LOW_ALIGNMENT);
+    if (!record_is_informative(primary)) {
         return NULL;
     }
 
-    expected = (int64_t)primary->stream_index + engine->alignment.offset_packets;
-    for (delta = -8; delta <= 8; delta++) {
-        int64_t candidate_index = expected + delta;
-        packet_record_t *candidate;
+    if (engine->alignment.has_alignment &&
+        engine->alignment.confidence >= engine->config.min_alignment_confidence / 2U) {
+        expected = (int64_t)primary->stream_index + engine->alignment.offset_packets;
+        for (delta = -8; delta <= 8; delta++) {
+            int64_t candidate_index = expected + delta;
+            packet_record_t *candidate;
 
-        if (candidate_index < 0) {
-            continue;
-        }
+            if (candidate_index < 0) {
+                continue;
+            }
 
-        candidate = packet_history_find_index(secondary, (uint64_t)candidate_index);
-        if (candidate != NULL && secondary_match_within_latency(engine, primary, candidate) &&
-            score_alignment_match(primary, candidate) >= RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
-            return candidate;
+            candidate = packet_history_find_index(secondary, (uint64_t)candidate_index);
+            if (candidate != NULL && secondary_match_within_latency(engine, primary, candidate) &&
+                score_alignment_match(primary, candidate) >= RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
+                return candidate;
+            }
         }
+    }
+
+    if (engine->last_primary_anchor.valid &&
+        primary->stream_index > engine->last_primary_anchor.primary_index) {
+        uint64_t primary_between = primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL;
+        uint64_t first_index = engine->last_primary_anchor.secondary_index + 1ULL;
+        uint64_t last_index = first_index + primary_between +
+                              (uint64_t)engine->config.max_content_burst_packets;
+        uint64_t index;
+
+        for (index = first_index; index <= last_index; index++) {
+            packet_record_t *candidate = packet_history_find_index(secondary, index);
+
+            if (candidate == NULL) {
+                continue;
+            }
+            if (candidate->stream_index <= engine->last_primary_anchor.secondary_index) {
+                continue;
+            }
+            if (secondary_match_within_latency(engine, primary, candidate) &&
+                score_alignment_match(primary, candidate) >= RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
+                return candidate;
+            }
+        }
+    }
+
+    if (!engine->alignment.has_alignment ||
+        engine->alignment.confidence < engine->config.min_alignment_confidence / 2U) {
+        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_LOW_ALIGNMENT);
     }
 
     return NULL;
@@ -704,6 +734,110 @@ static int recover_nulls_before_primary(recovery_engine_t *engine, const packet_
     }
 
     return 0;
+}
+
+static int recover_anchored_secondary_gap_before_primary(recovery_engine_t *engine,
+                                                         const packet_record_t *primary,
+                                                         const packet_record_t *secondary_match)
+{
+    uint64_t primary_between;
+    uint64_t secondary_between;
+    uint64_t missing_packets;
+    uint64_t index;
+    packet_record_t *candidates[RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS];
+    output_pid_state_t states[REPORT_STATS_PIDS];
+    uint64_t recovered = 0;
+    uint64_t recovered_content = 0;
+    uint8_t expected_counter;
+    uint8_t cc_missing_count;
+    bool primary_cc_gap;
+
+    if (!engine->last_primary_anchor.valid || secondary_match == NULL ||
+        secondary_match->stream_index <= engine->last_primary_anchor.secondary_index ||
+        primary->stream_index <= engine->last_primary_anchor.primary_index) {
+        return 0;
+    }
+
+    primary_between = primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL;
+    secondary_between = secondary_match->stream_index - engine->last_primary_anchor.secondary_index - 1ULL;
+    if (secondary_between <= primary_between) {
+        return 0;
+    }
+
+    missing_packets = secondary_between - primary_between;
+    primary_cc_gap = continuity_gap_for_record(engine, primary, &expected_counter, &cc_missing_count);
+    if (missing_packets < 16U) {
+        if (!primary_cc_gap) {
+            return 0;
+        }
+        if ((uint64_t)cc_missing_count != missing_packets) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_AMBIGUOUS);
+            engine->stats->unrecoverable_loss++;
+            return 0;
+        }
+    }
+    if (missing_packets > engine->config.max_content_burst_packets) {
+        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_BURST_TOO_LARGE);
+        return 0;
+    }
+    if (missing_packets > RECOVERY_ENGINE_MAX_STREAM_GAP_RECOVERY_PACKETS) {
+        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_BURST_TOO_LARGE);
+        return 0;
+    }
+
+    memcpy(states, engine->output_pid_state, sizeof(states));
+    for (index = engine->last_primary_anchor.secondary_index + 1ULL; index < secondary_match->stream_index; index++) {
+        packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
+
+        if (candidate == NULL) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_MISSING_CANDIDATE);
+            engine->stats->unrecoverable_loss++;
+            return 0;
+        }
+        if (candidate->transport_error) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_TEI);
+            engine->stats->unrecoverable_loss++;
+            return 0;
+        }
+        if (candidate->discontinuity_indicator) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_DISCONTINUITY);
+            engine->stats->unrecoverable_loss++;
+            return 0;
+        }
+        if (missing_packets < 16U && !candidate->is_null && candidate->pid != primary->pid) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_PID);
+            engine->stats->unrecoverable_loss++;
+            return 0;
+        }
+        if (!record_fits_output_states(states, candidate)) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
+            engine->stats->unrecoverable_loss++;
+            return 0;
+        }
+        observe_output_states(states, candidate);
+        candidates[recovered] = candidate;
+        if (!candidate->is_null) {
+            recovered_content++;
+        }
+        recovered++;
+    }
+
+    if (recovered != missing_packets) {
+        report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_MISSING_CANDIDATE);
+        engine->stats->unrecoverable_loss++;
+        return 0;
+    }
+    for (index = 0; index < recovered; index++) {
+        if (output_record(engine, candidates[index]) != 0) {
+            return -1;
+        }
+        report_stats_observe_recovery(engine->stats, candidates[index]->is_null);
+    }
+    if (recovered_content > 1) {
+        engine->stats->recovered_content_bursts++;
+    }
+
+    return (int)recovered;
 }
 
 static int recover_content_burst_by_counter_before_primary(recovery_engine_t *engine,
@@ -2075,16 +2209,27 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             }
 
             secondary_match = find_secondary_match_for_primary(engine, record);
-            if (recover_nulls_before_primary(engine, record, secondary_match) != 0) {
-                return -1;
-            }
+            {
+                int anchored_recovered =
+                    recover_anchored_secondary_gap_before_primary(engine, record, secondary_match);
 
-            if (recover_pid_gap_before_primary(engine, record) != 0) {
-                return -1;
+                if (anchored_recovered < 0) {
+                    return -1;
+                }
+                if (anchored_recovered == 0) {
+                    if (recover_nulls_before_primary(engine, record, secondary_match) != 0) {
+                        return -1;
+                    }
+                }
             }
+            if (!record_fits_next_output(engine, record)) {
+                if (recover_pid_gap_before_primary(engine, record) != 0) {
+                    return -1;
+                }
 
-            if (recover_content_burst_before_primary(engine, record, secondary_match) != 0) {
-                return -1;
+                if (recover_content_burst_before_primary(engine, record, secondary_match) != 0) {
+                    return -1;
+                }
             }
 
             diagnose_secondary_loss_before_primary(engine, record, secondary_match);
