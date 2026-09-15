@@ -118,16 +118,29 @@ static packet_record_t *packet_history_get_newest(packet_history_t *history, siz
 
 static packet_record_t *packet_history_find_index(packet_history_t *history, uint64_t stream_index)
 {
-    size_t i;
+    uint64_t oldest_stream_index;
+    uint64_t offset;
+    size_t index;
 
-    for (i = 0; i < history->count; i++) {
-        size_t index = (history->start + i) % history->capacity;
-        if (history->records[index].stream_index == stream_index) {
-            return &history->records[index];
-        }
+    if (history->count == 0) {
+        return NULL;
     }
 
-    return NULL;
+    oldest_stream_index = history->records[history->start].stream_index;
+    if (stream_index < oldest_stream_index) {
+        return NULL;
+    }
+
+    offset = stream_index - oldest_stream_index;
+    if (offset >= history->count) {
+        return NULL;
+    }
+
+    index = (history->start + (size_t)offset) % history->capacity;
+    if (history->records[index].stream_index != stream_index) {
+        return NULL;
+    }
+    return &history->records[index];
 }
 
 static bool record_is_informative(const packet_record_t *record)
@@ -976,10 +989,13 @@ static packet_record_t *find_secondary_counter_candidate(recovery_engine_t *engi
         if (candidate == NULL) {
             break;
         }
-        if (engine->config.max_secondary_latency_ns > 0 &&
-            time_difference_ns(primary->arrival_time_ns, candidate->arrival_time_ns) >
-                engine->config.max_secondary_latency_ns) {
-            continue;
+        if (engine->config.max_secondary_latency_ns > 0) {
+            if (candidate->arrival_time_ns > primary->arrival_time_ns + engine->config.max_secondary_latency_ns) {
+                continue;
+            }
+            if (candidate->arrival_time_ns + engine->config.max_secondary_latency_ns < primary->arrival_time_ns) {
+                break;
+            }
         }
         if (candidate->pid != primary->pid || candidate->continuity_counter != continuity_counter ||
             !candidate->has_payload || candidate->is_null || candidate->transport_error ||

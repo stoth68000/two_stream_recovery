@@ -48,19 +48,6 @@ static bool send_all(int client_fd, const void *buffer, size_t bytes)
             continue;
         }
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            fd_set write_fds;
-            struct timeval timeout;
-            int ready;
-
-            FD_ZERO(&write_fds);
-            FD_SET(client_fd, &write_fds);
-            timeout.tv_sec = 1;
-            timeout.tv_usec = 0;
-
-            ready = select(client_fd + 1, NULL, &write_fds, NULL, &timeout);
-            if (ready > 0 && FD_ISSET(client_fd, &write_fds)) {
-                continue;
-            }
             return false;
         }
         if (sent <= 0) {
@@ -242,6 +229,7 @@ static void handle_client(web_server_t *server, int client_fd, report_stats_t *s
     char request[HTTP_REQUEST_SIZE];
     char method[8];
     char path[256];
+    char *query;
     ssize_t received;
 
     received = recv(client_fd, request, sizeof(request) - 1U, 0);
@@ -257,6 +245,10 @@ static void handle_client(web_server_t *server, int client_fd, report_stats_t *s
     if (strcmp(method, "GET") != 0) {
         send_error(client_fd, 405, "method not allowed");
         return;
+    }
+    query = strchr(path, '?');
+    if (query != NULL) {
+        *query = '\0';
     }
     if (strcmp(path, "/api/stats") == 0) {
         handle_api_stats(client_fd, stats);
@@ -278,6 +270,10 @@ void web_server_handle_ready(web_server_t *server, report_stats_t *stats)
                 }
             }
             return;
+        }
+        if (set_nonblocking(client_fd) != 0) {
+            close(client_fd);
+            continue;
         }
         if (!wait_for_client_request(client_fd)) {
             close(client_fd);

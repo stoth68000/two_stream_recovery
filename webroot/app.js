@@ -141,16 +141,28 @@ function render(data) {
 }
 
 async function refresh() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+
   try {
-    const response = await fetch("/api/stats", { cache: "no-store" });
+    const response = await fetch(`/api/stats?ts=${Date.now()}`, {
+      cache: "no-store",
+      signal: controller.signal
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     render(await response.json());
   } catch (err) {
     const status = document.getElementById("api-status");
     status.textContent = "offline";
     status.className = "pill bad";
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-refresh();
-setInterval(refresh, 1000);
+async function refreshLoop() {
+  await refresh();
+  setTimeout(refreshLoop, 1000);
+}
+
+refreshLoop();

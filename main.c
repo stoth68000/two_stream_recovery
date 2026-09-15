@@ -217,6 +217,7 @@ int main(int argc, char **argv)
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+    signal(SIGPIPE, SIG_IGN);
 
     if (input_udp_open_with_interface(&inputs[0], options.input_primary_url,
                                       options.input_primary_interface) != 0) {
