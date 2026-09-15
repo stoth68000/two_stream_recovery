@@ -713,6 +713,32 @@ static void test_primary_pass_through(void)
     recovery_engine_free(&engine);
 }
 
+static void test_pcr_latency_samples_from_matching_inputs(void)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+
+    for (i = 0; i < 3; i++) {
+        make_pcr_packet(packet, 0x100, (uint8_t)i, 90000ULL * (uint64_t)(i + 1U));
+        push_packet(&engine, &stats, 0, packet);
+        push_packet(&engine, &stats, 1, packet);
+    }
+
+    assert(stats.pcr_delay_samples >= 3);
+    assert(stats.pcr_timing_confidence[0] > 0);
+    assert(stats.pcr_timing_confidence[1] > 0);
+    assert(stats.pcr_bitrate_bps[0] > 0.0);
+    assert(stats.pcr_bitrate_bps[1] > 0.0);
+
+    recovery_engine_free(&engine);
+}
+
 static void test_clean_dual_input_baseline_no_recovery(void)
 {
     recovery_engine_t engine;
@@ -2651,6 +2677,7 @@ int main(void)
     test_report_stats_offline_return_resets_input_continuity();
     test_report_stats_delay_overflow_does_not_poison_health();
     test_primary_pass_through();
+    test_pcr_latency_samples_from_matching_inputs();
     test_clean_dual_input_baseline_no_recovery();
     test_repeated_null_packets_do_not_create_anchor_ambiguity();
     test_exact_single_packet_content_recovery();

@@ -527,6 +527,106 @@ static void update_alignment_from_match(recovery_engine_t *engine, const packet_
                                  engine->config.max_secondary_latency_ns);
 }
 
+static pcr_pid_model_t *pcr_pid_model_for(recovery_engine_t *engine, int stream_id, uint16_t pid)
+{
+    pcr_pid_model_t *free_model = NULL;
+    size_t i;
+
+    for (i = 0; i < RECOVERY_ENGINE_MAX_PCR_PIDS; i++) {
+        pcr_pid_model_t *model = &engine->pcr_model[stream_id].pid_models[i];
+
+        if (model->active && model->pid == pid) {
+            return model;
+        }
+        if (!model->active && free_model == NULL) {
+            free_model = model;
+        }
+    }
+
+    if (free_model != NULL) {
+        memset(free_model, 0, sizeof(*free_model));
+        free_model->active = true;
+        free_model->pid = pid;
+    }
+    return free_model;
+}
+
+static const packet_record_t *find_matching_pcr_record(const packet_history_t *history,
+                                                       const packet_record_t *record)
+{
+    const packet_record_t *best = NULL;
+    size_t i;
+
+    for (i = 0; i < history->count; i++) {
+        size_t index = (history->start + i) % history->capacity;
+        const packet_record_t *candidate = &history->records[index];
+
+        if (!candidate->has_pcr || candidate->pid != record->pid ||
+            candidate->pcr_value != record->pcr_value ||
+            candidate->transport_error || candidate->discontinuity_indicator) {
+            continue;
+        }
+        if (best == NULL || candidate->arrival_time_ns > best->arrival_time_ns) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+static void update_pcr_timing(recovery_engine_t *engine, const packet_record_t *record)
+{
+    pcr_pid_model_t *model;
+    const packet_record_t *match;
+    int stream_id = record->source_stream_id;
+    int other_stream_id = stream_id == 0 ? 1 : 0;
+
+    if (!record->has_pcr || record->transport_error || record->discontinuity_indicator) {
+        return;
+    }
+
+    model = pcr_pid_model_for(engine, stream_id, record->pid);
+    if (model != NULL) {
+        if (model->last_arrival_time_ns != 0 && record->pcr_value > model->last_pcr &&
+            record->stream_index > model->last_stream_index) {
+            double pcr_seconds = (double)(record->pcr_value - model->last_pcr) / 90000.0;
+            double packet_bits = (double)(record->stream_index - model->last_stream_index) *
+                                 (double)TS_PACKET_SIZE * 8.0;
+
+            if (pcr_seconds > 0.0) {
+                double bitrate_bps = packet_bits / pcr_seconds;
+                model->bitrate_bps = model->bitrate_bps == 0.0
+                                         ? bitrate_bps
+                                         : (model->bitrate_bps * 0.875) + (bitrate_bps * 0.125);
+                engine->stats->pcr_bitrate_bps[stream_id] = model->bitrate_bps;
+                if (model->confidence < 100U) {
+                    model->confidence += model->confidence > 95U ? 100U - model->confidence : 5U;
+                }
+                engine->pcr_model[stream_id].confidence = model->confidence;
+                engine->stats->pcr_timing_confidence[stream_id] = model->confidence;
+            }
+        }
+        model->last_pcr = record->pcr_value;
+        model->last_stream_index = record->stream_index;
+        model->last_arrival_time_ns = record->arrival_time_ns;
+    }
+
+    match = find_matching_pcr_record(&engine->history[other_stream_id], record);
+    if (match != NULL) {
+        double sample_ns;
+
+        if (stream_id == 0) {
+            sample_ns = (double)((int64_t)match->arrival_time_ns -
+                                 (int64_t)record->arrival_time_ns);
+        } else {
+            sample_ns = (double)((int64_t)record->arrival_time_ns -
+                                 (int64_t)match->arrival_time_ns);
+        }
+        engine->pcr_model[stream_id].estimated_delay_ns = sample_ns;
+        engine->pcr_model[other_stream_id].estimated_delay_ns = sample_ns;
+        report_stats_observe_pcr_delay(engine->stats, sample_ns);
+    }
+}
+
 static bool has_confirmed_backward_run(packet_history_t *self,
                                        packet_history_t *other,
                                        const packet_record_t *record,
@@ -2102,6 +2202,7 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
 
     engine->decision_candidate_count = 0;
     engine->decision_candidates_truncated = false;
+    update_pcr_timing(engine, record);
     observe_input_path_gap(engine, stream_id, record);
     update_alignment(engine, stream_id, record);
 
