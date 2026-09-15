@@ -614,6 +614,13 @@ static void update_pcr_timing(recovery_engine_t *engine, const packet_record_t *
     if (match != NULL) {
         double sample_ns;
 
+        if (records_exact_non_error_match(record, match)) {
+            if (stream_id == 0) {
+                update_alignment_from_match(engine, record, match);
+            } else {
+                update_alignment_from_match(engine, match, record);
+            }
+        }
         if (stream_id == 0) {
             sample_ns = (double)((int64_t)match->arrival_time_ns -
                                  (int64_t)record->arrival_time_ns);
@@ -2227,13 +2234,22 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
 int recovery_engine_drain(recovery_engine_t *engine, bool force)
 {
     uint64_t now_ns = report_stats_now_ns();
+    bool primary_return_ready = primary_return_holdoff_elapsed(engine, now_ns);
 
-    if (engine->primary_queue.count == 0 ||
-        !primary_return_holdoff_elapsed(engine, now_ns)) {
+    if (engine->primary_queue.count == 0) {
+        if (engine->active_output_stream_id == 1 && primary_return_ready) {
+            return 0;
+        }
+        return drain_secondary_on_primary_outage(engine, force, now_ns);
+    }
+    if (!primary_return_ready) {
         return drain_secondary_on_primary_outage(engine, force, now_ns);
     }
     discard_primary_records_already_output_by_secondary(engine);
     if (engine->primary_queue.count == 0) {
+        if (engine->active_output_stream_id == 1) {
+            return 0;
+        }
         return drain_secondary_on_primary_outage(engine, force, now_ns);
     }
     set_active_output_stream(engine, 0);

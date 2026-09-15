@@ -739,6 +739,34 @@ static void test_pcr_latency_samples_from_matching_inputs(void)
     recovery_engine_free(&engine);
 }
 
+static void test_pcr_match_reacquires_alignment_after_large_offset_change(void)
+{
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.alignment.has_alignment = true;
+    engine.alignment.offset_packets = -128;
+    engine.alignment.confidence = 0;
+    stats.alignment_confidence = 0;
+
+    make_pcr_packet(packet, 0x100, 0, 90000ULL);
+    push_packet(&engine, &stats, 0, packet);
+    engine.next_stream_index[1] = 100000ULL;
+    push_packet(&engine, &stats, 1, packet);
+
+    assert(engine.alignment.has_alignment);
+    assert(engine.alignment.confidence == 100);
+    assert(stats.alignment_confidence == 100);
+    assert(engine.alignment.offset_packets == 100000);
+    assert(stats.alignment_offset_packets == 100000);
+
+    recovery_engine_free(&engine);
+}
+
 static void test_clean_dual_input_baseline_no_recovery(void)
 {
     recovery_engine_t engine;
@@ -1566,6 +1594,66 @@ static void test_primary_return_holdoff_keeps_secondary_active(void)
         make_packet(packet, 0x127, (uint8_t)i, (uint8_t)(0x50 + i));
         assert(memcmp(capture.packets[i], packet, TS_PACKET_SIZE) == 0);
     }
+
+    recovery_engine_free(&engine);
+}
+
+static void test_primary_return_waits_for_primary_to_catch_secondary(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+    uint64_t now_ns;
+    size_t i;
+
+    config.primary_delay_ns = 0;
+    config.primary_outage_ns = 1000000000ULL;
+    config.primary_return_ns = 1000000000ULL;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    for (i = 0; i < 12; i++) {
+        make_packet(packet, 0x12a, (uint8_t)i, (uint8_t)(0x30 + i));
+        push_packet(&engine, &stats, 0, packet);
+        push_packet(&engine, &stats, 1, packet);
+    }
+    assert(engine.alignment.has_alignment);
+    assert(capture.packet_count == 12);
+
+    now_ns = report_stats_now_ns();
+    engine.last_input_arrival_ns[0] = now_ns - 2000000000ULL;
+    for (i = 12; i < 16; i++) {
+        make_packet(packet, 0x12a, (uint8_t)i, (uint8_t)(0x30 + i));
+        push_packet(&engine, &stats, 1, packet);
+    }
+    assert(engine.active_output_stream_id == 1);
+    assert(capture.packet_count == 16);
+
+    for (i = 12; i < 16; i++) {
+        make_packet(packet, 0x12a, (uint8_t)i, (uint8_t)(0x30 + i));
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(capture.packet_count == 16);
+
+    engine.primary_return_start_ns = report_stats_now_ns() - 2000000000ULL;
+    assert(recovery_engine_drain(&engine, false) == 0);
+    assert(engine.active_output_stream_id == 1);
+    assert(capture.packet_count == 16);
+
+    make_packet(packet, 0x12a, 0, 0x40);
+    push_packet(&engine, &stats, 1, packet);
+    assert(engine.active_output_stream_id == 1);
+    assert(capture.packet_count == 16);
+
+    push_packet(&engine, &stats, 0, packet);
+    assert(engine.active_output_stream_id == 0);
+    assert(stats.source_switches[0] == 1);
+    assert(capture.packet_count == 17);
+    assert(memcmp(capture.packets[16], packet, TS_PACKET_SIZE) == 0);
+    assert(stats.output_continuity_errors == 0);
 
     recovery_engine_free(&engine);
 }
@@ -2678,6 +2766,7 @@ int main(void)
     test_report_stats_delay_overflow_does_not_poison_health();
     test_primary_pass_through();
     test_pcr_latency_samples_from_matching_inputs();
+    test_pcr_match_reacquires_alignment_after_large_offset_change();
     test_clean_dual_input_baseline_no_recovery();
     test_repeated_null_packets_do_not_create_anchor_ambiguity();
     test_exact_single_packet_content_recovery();
@@ -2698,6 +2787,7 @@ int main(void)
     test_primary_outage_drains_secondary();
     test_primary_outage_skips_secondary_backlog();
     test_primary_return_holdoff_keeps_secondary_active();
+    test_primary_return_waits_for_primary_to_catch_secondary();
     test_primary_return_skips_packets_already_output_by_secondary();
     test_live_equivalent_one_datagram_loss_recovers();
     test_live_equivalent_two_datagram_loss_recovers();
