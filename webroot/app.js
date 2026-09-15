@@ -50,7 +50,11 @@ function healthClass(health) {
 }
 
 function outputHealth(data) {
-  return (data.output_continuity_errors || data.output_duplicate_counters) ? "degraded" : "healthy";
+  return data.output_health || ((data.output_continuity_errors || data.output_duplicate_counters) ? "degraded" : "healthy");
+}
+
+function sourceName(streamId) {
+  return Number(streamId) === 1 ? "secondary" : "primary";
 }
 
 function renderStreamRow(name, health, cells) {
@@ -82,6 +86,7 @@ function render(data) {
   setText("latency_avg", fmtMs(value(["latency_ms", "avg"], data)));
   setText("latency_jitter", `jitter ${fmtMs(value(["latency_ms", "jitter"], data))}`);
   setText("alignment", `alignment ${data.alignment_confidence || 0}%`);
+  setText("active-output", `output ${sourceName(data.active_output_stream_id)}`);
 
   const status = document.getElementById("api-status");
   status.textContent = "live";
@@ -119,7 +124,9 @@ function render(data) {
     ["Secondary loss events", fmt(data.secondary_loss_events), recoveryHelp["Secondary loss events"]],
     ["Missing packets", fmt(data.secondary_missing_packets), recoveryHelp["Missing packets"]],
     ["Missing anchors", fmt(data.secondary_missing_anchors), recoveryHelp["Missing anchors"]],
-    ["Delay overflows", fmt(data.primary_delay_overflows), recoveryHelp["Delay overflows"]]
+    ["Delay overflows", fmt(data.primary_delay_overflows), recoveryHelp["Delay overflows"]],
+    ["Switches to primary", fmt(value(["source_switches", 0], data))],
+    ["Switches to secondary", fmt(value(["source_switches", 1], data))]
   ]);
 
   renderDefinitionList("latency", [

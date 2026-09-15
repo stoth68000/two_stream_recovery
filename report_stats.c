@@ -18,9 +18,12 @@ void report_stats_init(report_stats_t *stats)
 {
     memset(stats, 0, sizeof(*stats));
     stats->last_report_ns = report_stats_now_ns();
+    stats->last_sample_ns = stats->last_report_ns;
+    stats->active_output_stream_id = 0;
     stats->observed_secondary_latency_min_ns = 0.0;
     stats->stream_health[0] = STREAM_HEALTH_HEALTHY;
     stats->stream_health[1] = STREAM_HEALTH_HEALTHY;
+    stats->output_health = STREAM_HEALTH_HEALTHY;
 }
 
 void report_stats_observe_datagram(report_stats_t *stats, int stream_id, size_t bytes)
@@ -148,13 +151,16 @@ void report_stats_observe_latency(report_stats_t *stats, uint64_t primary_arriva
 
 void report_stats_observe_recovery(report_stats_t *stats, bool is_null_packet)
 {
+    time_t now;
+
     stats->recovered_packets++;
     if (is_null_packet) {
         stats->recovered_null_packets++;
     } else {
         stats->recovered_content_packets++;
     }
-    stats->last_recovery_event_time = time(NULL);
+    now = time(NULL);
+    stats->last_recovery_event_time = now == 0 ? 1 : now;
 }
 
 void report_stats_reject_recovery(report_stats_t *stats, recovery_reject_reason_t reason)
@@ -203,55 +209,6 @@ static void report_stats_wall_time(char *timestamp, size_t timestamp_size, time_
     strftime(timestamp, timestamp_size, "%Y-%m-%d %H:%M:%S %z", &local_tm);
 }
 
-static void update_stream_health(report_stats_t *stats)
-{
-    int stream_id;
-
-    for (stream_id = 0; stream_id < REPORT_STATS_STREAMS; stream_id++) {
-        uint64_t errors = stats->sync_errors[stream_id] +
-                          stats->transport_errors[stream_id] +
-                          stats->continuity_errors[stream_id];
-        uint64_t packets = stats->packets_received[stream_id];
-
-        if (packets == 0) {
-            stats->stream_health[stream_id] = STREAM_HEALTH_DEGRADED;
-        } else if (errors * 1000ULL >= packets * 50ULL) {
-            stats->stream_health[stream_id] = STREAM_HEALTH_UNTRUSTED;
-        } else if (errors * 1000ULL >= packets * 10ULL) {
-            stats->stream_health[stream_id] = STREAM_HEALTH_LOSSY;
-        } else if (errors > 0) {
-            stats->stream_health[stream_id] = STREAM_HEALTH_DEGRADED;
-        } else {
-            stats->stream_health[stream_id] = STREAM_HEALTH_HEALTHY;
-        }
-    }
-
-    if (stats->secondary_packets_too_late > 0 &&
-        stats->stream_health[1] == STREAM_HEALTH_HEALTHY) {
-        stats->stream_health[1] = STREAM_HEALTH_DEGRADED;
-    }
-}
-
-static void capture_rolling_sample(report_stats_t *stats)
-{
-    report_stats_sample_t *sample = &stats->rolling_samples[stats->rolling_index];
-
-    memset(sample, 0, sizeof(*sample));
-    sample->packets_received[0] = stats->packets_received[0];
-    sample->packets_received[1] = stats->packets_received[1];
-    sample->continuity_errors[0] = stats->continuity_errors[0];
-    sample->continuity_errors[1] = stats->continuity_errors[1];
-    sample->recovered_packets = stats->recovered_packets;
-    sample->unrecoverable_loss = stats->unrecoverable_loss;
-    sample->output_packets = stats->output_packets;
-    sample->alignment_confidence = stats->alignment_confidence;
-
-    stats->rolling_index = (stats->rolling_index + 1U) % REPORT_STATS_ROLLING_SECONDS;
-    if (stats->rolling_count < REPORT_STATS_ROLLING_SECONDS) {
-        stats->rolling_count++;
-    }
-}
-
 static const report_stats_sample_t *oldest_rolling_sample(const report_stats_t *stats)
 {
     if (stats->rolling_count == 0) {
@@ -262,6 +219,188 @@ static const report_stats_sample_t *oldest_rolling_sample(const report_stats_t *
     }
 
     return &stats->rolling_samples[stats->rolling_index];
+}
+
+static const report_stats_sample_t *rolling_sample_ago(const report_stats_t *stats, size_t seconds)
+{
+    size_t newest_index;
+    size_t index;
+
+    if (stats->rolling_count == 0) {
+        return NULL;
+    }
+    if (seconds >= stats->rolling_count) {
+        return oldest_rolling_sample(stats);
+    }
+
+    newest_index = stats->rolling_index == 0
+                       ? REPORT_STATS_ROLLING_SECONDS - 1U
+                       : stats->rolling_index - 1U;
+    index = (newest_index + REPORT_STATS_ROLLING_SECONDS - seconds) %
+            REPORT_STATS_ROLLING_SECONDS;
+    return &stats->rolling_samples[index];
+}
+
+static uint64_t stream_problem_delta(const report_stats_t *stats,
+                                     const report_stats_sample_t *sample,
+                                     int stream_id)
+{
+    uint64_t problems;
+
+    if (sample == NULL) {
+        problems = stats->sync_errors[stream_id] +
+                   stats->transport_errors[stream_id] +
+                   stats->continuity_errors[stream_id] +
+                   stats->duplicate_counters[stream_id];
+    } else {
+        problems = stats->sync_errors[stream_id] - sample->sync_errors[stream_id];
+        problems += stats->transport_errors[stream_id] - sample->transport_errors[stream_id];
+        problems += stats->continuity_errors[stream_id] - sample->continuity_errors[stream_id];
+        problems += stats->duplicate_counters[stream_id] - sample->duplicate_counters[stream_id];
+    }
+
+    if (stream_id == 0) {
+        problems += sample == NULL ? stats->recovered_packets
+                                   : stats->recovered_packets - sample->recovered_packets;
+        problems += sample == NULL ? stats->unrecoverable_loss
+                                   : stats->unrecoverable_loss - sample->unrecoverable_loss;
+        problems += sample == NULL ? stats->primary_delay_overflows
+                                   : stats->primary_delay_overflows - sample->primary_delay_overflows;
+        problems += sample == NULL ? stats->primary_delay_insufficient
+                                   : stats->primary_delay_insufficient - sample->primary_delay_insufficient;
+        problems += sample == NULL ? stats->recovery_exact_cc_gap
+                                   : stats->recovery_exact_cc_gap - sample->recovery_exact_cc_gap;
+    } else {
+        problems += sample == NULL ? stats->secondary_loss_events
+                                   : stats->secondary_loss_events - sample->secondary_loss_events;
+        problems += sample == NULL ? stats->secondary_missing_packets
+                                   : stats->secondary_missing_packets - sample->secondary_missing_packets;
+        problems += sample == NULL ? stats->secondary_missing_anchors
+                                   : stats->secondary_missing_anchors - sample->secondary_missing_anchors;
+        problems += sample == NULL ? stats->secondary_packets_too_late
+                                   : stats->secondary_packets_too_late - sample->secondary_packets_too_late;
+    }
+
+    problems += sample == NULL ? stats->stream_disagreements
+                               : stats->stream_disagreements - sample->stream_disagreements;
+    return problems;
+}
+
+static uint64_t output_problem_delta(const report_stats_t *stats,
+                                     const report_stats_sample_t *sample)
+{
+    uint64_t problems;
+
+    if (sample == NULL) {
+        problems = stats->output_continuity_errors +
+                   stats->output_duplicate_counters +
+                   stats->unrecoverable_loss +
+                   stats->primary_delay_overflows;
+    } else {
+        problems = stats->output_continuity_errors - sample->output_continuity_errors;
+        problems += stats->output_duplicate_counters - sample->output_duplicate_counters;
+        problems += stats->unrecoverable_loss - sample->unrecoverable_loss;
+        problems += stats->primary_delay_overflows - sample->primary_delay_overflows;
+    }
+    return problems;
+}
+
+static stream_health_t health_from_recent(uint64_t packets, uint64_t problems,
+                                          uint64_t quiet_problems)
+{
+    if (packets == 0) {
+        return STREAM_HEALTH_DEGRADED;
+    }
+    if (problems == 0 && quiet_problems == 0) {
+        return STREAM_HEALTH_HEALTHY;
+    }
+    if (problems * 1000ULL >= packets * 50ULL) {
+        return STREAM_HEALTH_UNTRUSTED;
+    }
+    if (problems * 1000ULL >= packets * 10ULL) {
+        return STREAM_HEALTH_LOSSY;
+    }
+    return STREAM_HEALTH_DEGRADED;
+}
+
+static void update_stream_health(report_stats_t *stats)
+{
+    const report_stats_sample_t *window_sample = oldest_rolling_sample(stats);
+    const report_stats_sample_t *quiet_sample = rolling_sample_ago(stats, REPORT_STATS_QUIET_SECONDS);
+    int stream_id;
+
+    for (stream_id = 0; stream_id < REPORT_STATS_STREAMS; stream_id++) {
+        uint64_t packets = window_sample == NULL
+                               ? stats->packets_received[stream_id]
+                               : stats->packets_received[stream_id] -
+                                     window_sample->packets_received[stream_id];
+        uint64_t problems = stream_problem_delta(stats, window_sample, stream_id);
+        uint64_t quiet_problems = stream_problem_delta(stats, quiet_sample, stream_id);
+
+        stats->stream_health[stream_id] =
+            health_from_recent(packets, problems, quiet_problems);
+    }
+
+    stats->output_health =
+        health_from_recent(window_sample == NULL ? stats->output_packets
+                                                 : stats->output_packets - window_sample->output_packets,
+                           output_problem_delta(stats, window_sample),
+                           output_problem_delta(stats, quiet_sample));
+}
+
+static void capture_rolling_sample(report_stats_t *stats)
+{
+    report_stats_sample_t *sample = &stats->rolling_samples[stats->rolling_index];
+
+    memset(sample, 0, sizeof(*sample));
+    sample->packets_received[0] = stats->packets_received[0];
+    sample->packets_received[1] = stats->packets_received[1];
+    sample->sync_errors[0] = stats->sync_errors[0];
+    sample->sync_errors[1] = stats->sync_errors[1];
+    sample->transport_errors[0] = stats->transport_errors[0];
+    sample->transport_errors[1] = stats->transport_errors[1];
+    sample->continuity_errors[0] = stats->continuity_errors[0];
+    sample->continuity_errors[1] = stats->continuity_errors[1];
+    sample->duplicate_counters[0] = stats->duplicate_counters[0];
+    sample->duplicate_counters[1] = stats->duplicate_counters[1];
+    sample->recovered_packets = stats->recovered_packets;
+    sample->unrecoverable_loss = stats->unrecoverable_loss;
+    sample->output_packets = stats->output_packets;
+    sample->output_continuity_errors = stats->output_continuity_errors;
+    sample->output_duplicate_counters = stats->output_duplicate_counters;
+    sample->stream_disagreements = stats->stream_disagreements;
+    sample->primary_delay_overflows = stats->primary_delay_overflows;
+    sample->secondary_loss_events = stats->secondary_loss_events;
+    sample->secondary_missing_packets = stats->secondary_missing_packets;
+    sample->secondary_missing_anchors = stats->secondary_missing_anchors;
+    sample->secondary_packets_too_late = stats->secondary_packets_too_late;
+    sample->primary_delay_insufficient = stats->primary_delay_insufficient;
+    sample->recovery_exact_cc_gap = stats->recovery_exact_cc_gap;
+    sample->source_switches[0] = stats->source_switches[0];
+    sample->source_switches[1] = stats->source_switches[1];
+    sample->active_output_stream_id = stats->active_output_stream_id;
+    sample->alignment_confidence = stats->alignment_confidence;
+
+    stats->rolling_index = (stats->rolling_index + 1U) % REPORT_STATS_ROLLING_SECONDS;
+    if (stats->rolling_count < REPORT_STATS_ROLLING_SECONDS) {
+        stats->rolling_count++;
+    }
+}
+
+void report_stats_tick(report_stats_t *stats)
+{
+    uint64_t now_ns = report_stats_now_ns();
+
+    if (now_ns == 0) {
+        return;
+    }
+    if (stats->last_sample_ns != 0 &&
+        now_ns - stats->last_sample_ns < 1000000000ULL) {
+        return;
+    }
+
+    capture_rolling_sample(stats);
+    stats->last_sample_ns = now_ns;
 }
 
 static void compute_rolling_window(const report_stats_t *stats,
@@ -305,6 +444,7 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
     uint64_t win_output;
     int written;
 
+    report_stats_tick(stats);
     update_stream_health(stats);
     report_stats_timestamp(timestamp, sizeof(timestamp));
     report_stats_wall_time(last_recovery_event, sizeof(last_recovery_event),
@@ -327,6 +467,7 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         "\"continuity_errors\":[%" PRIu64 ",%" PRIu64 "],"
         "\"win60_continuity_errors\":[%" PRIu64 ",%" PRIu64 "],"
         "\"health\":[\"%s\",\"%s\"],"
+        "\"output_health\":\"%s\","
         "\"duplicate_counters\":[%" PRIu64 ",%" PRIu64 "],"
         "\"null_packets\":[%" PRIu64 ",%" PRIu64 "],"
         "\"pcr_packets\":[%" PRIu64 ",%" PRIu64 "],"
@@ -362,6 +503,8 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         "\"win60_output\":%" PRIu64 ","
         "\"output_continuity_errors\":%" PRIu64 ","
         "\"output_duplicate_counters\":%" PRIu64 ","
+        "\"active_output_stream_id\":%d,"
+        "\"source_switches\":[%" PRIu64 ",%" PRIu64 "],"
         "\"output_datagrams\":%" PRIu64 ","
         "\"output_short_flushes\":%" PRIu64
         "}",
@@ -377,6 +520,7 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         stats->continuity_errors[0], stats->continuity_errors[1],
         win_cc_errors[0], win_cc_errors[1],
         stream_health_name(stats->stream_health[0]), stream_health_name(stats->stream_health[1]),
+        stream_health_name(stats->output_health),
         stats->duplicate_counters[0], stats->duplicate_counters[1],
         stats->null_packets[0], stats->null_packets[1],
         stats->pcr_packets[0], stats->pcr_packets[1],
@@ -420,6 +564,8 @@ int report_stats_format_json(report_stats_t *stats, char *buffer, size_t buffer_
         win_output,
         stats->output_continuity_errors,
         stats->output_duplicate_counters,
+        stats->active_output_stream_id,
+        stats->source_switches[0], stats->source_switches[1],
         stats->output_datagrams,
         stats->output_short_flushes);
 
@@ -443,8 +589,8 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
         return;
     }
 
+    report_stats_tick(stats);
     update_stream_health(stats);
-    capture_rolling_sample(stats);
     compute_rolling_window(stats, win_packets, win_cc_errors,
                            &win_recovered, &win_unrecoverable, &win_output);
     report_stats_timestamp(timestamp, sizeof(timestamp));
@@ -472,6 +618,7 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            " win60_recovered=%" PRIu64 " win60_unrecoverable=%" PRIu64
            " output=%" PRIu64 " win60_output=%" PRIu64
            " output_cc_errors=%" PRIu64 " output_duplicate_cc=%" PRIu64
+           " active_output=%d source_switches=[%" PRIu64 ",%" PRIu64 "]"
            " output_datagrams=%" PRIu64
            " output_short_flushes=%" PRIu64 "\n",
            timestamp,
@@ -517,6 +664,8 @@ void report_stats_maybe_print(report_stats_t *stats, bool force)
            win_recovered, win_unrecoverable,
            stats->output_packets, win_output,
            stats->output_continuity_errors, stats->output_duplicate_counters,
+           stats->active_output_stream_id,
+           stats->source_switches[0], stats->source_switches[1],
            stats->output_datagrams, stats->output_short_flushes);
     fflush(stdout);
 

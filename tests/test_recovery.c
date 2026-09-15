@@ -124,6 +124,16 @@ static void init_engine(recovery_engine_t *engine, report_stats_t *stats, captur
     assert(recovery_engine_init(engine, sink, stats) == 0);
 }
 
+static void init_engine_with_config(recovery_engine_t *engine, report_stats_t *stats,
+                                    capture_sink_t *capture, packet_sink_t *sink,
+                                    const recovery_engine_config_t *config)
+{
+    memset(capture, 0, sizeof(*capture));
+    report_stats_init(stats);
+    *sink = capture_as_packet_sink(capture);
+    assert(recovery_engine_init_with_config(engine, sink, stats, config) == 0);
+}
+
 static void test_command_line_parse(void)
 {
     command_line_options_t options;
@@ -138,6 +148,8 @@ static void test_command_line_parse(void)
         "--max-secondary-latency-ms", "7000",
         "--alignment-window-ms", "9000",
         "--history-ms", "12000",
+        "--primary-outage-ms", "750",
+        "--primary-return-ms", "180000",
         "--max-content-burst-packets", "25",
         "--min-alignment-confidence", "55",
         "--http-port", "9601",
@@ -214,6 +226,8 @@ static void test_command_line_parse(void)
     assert(options.recovery_config.max_secondary_latency_ns == 7000000000ULL);
     assert(options.recovery_config.alignment_window_ns == 9000000000ULL);
     assert(options.recovery_config.history_ms == 12000ULL);
+    assert(options.recovery_config.primary_outage_ns == 750000000ULL);
+    assert(options.recovery_config.primary_return_ns == 180000000000ULL);
     assert(options.recovery_config.max_content_burst_packets == 25U);
     assert(options.recovery_config.min_alignment_confidence == 55U);
     assert(options.http_port == 9601U);
@@ -228,6 +242,8 @@ static void test_command_line_parse(void)
            RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS);
     assert(options.recovery_config.alignment_window_ns == RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS);
     assert(options.recovery_config.history_ms == RECOVERY_ENGINE_DEFAULT_HISTORY_MS);
+    assert(options.recovery_config.primary_outage_ns == RECOVERY_ENGINE_DEFAULT_PRIMARY_OUTAGE_NS);
+    assert(options.recovery_config.primary_return_ns == RECOVERY_ENGINE_DEFAULT_PRIMARY_RETURN_NS);
     assert(options.recovery_config.max_content_burst_packets ==
            RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS);
     assert(options.recovery_config.min_alignment_confidence ==
@@ -477,6 +493,38 @@ static void test_report_stats_observe_edges(void)
     assert(stats.recovered_null_packets == 1);
 }
 
+static void test_report_stats_health_recovers_after_quiet_window(void)
+{
+    report_stats_t stats;
+    char json[8192];
+    size_t i;
+
+    report_stats_init(&stats);
+    stats.packets_received[0] = 1000;
+    stats.packets_received[1] = 1000;
+    stats.output_packets = 1000;
+    stats.recovered_packets = 1;
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"health\":[\"degraded\",\"healthy\"]") != NULL);
+
+    for (i = 0; i < REPORT_STATS_ROLLING_SECONDS; i++) {
+        stats.rolling_samples[i].packets_received[0] = stats.packets_received[0];
+        stats.rolling_samples[i].packets_received[1] = stats.packets_received[1];
+        stats.rolling_samples[i].output_packets = stats.output_packets;
+        stats.rolling_samples[i].recovered_packets = stats.recovered_packets;
+        stats.rolling_samples[i].unrecoverable_loss = stats.unrecoverable_loss;
+    }
+    stats.rolling_count = REPORT_STATS_ROLLING_SECONDS;
+    stats.rolling_index = 0;
+    stats.packets_received[0] += 1000;
+    stats.packets_received[1] += 1000;
+    stats.output_packets += 1000;
+
+    assert(report_stats_format_json(&stats, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"health\":[\"healthy\",\"healthy\"]") != NULL);
+    assert(strstr(json, "\"output_health\":\"healthy\"") != NULL);
+}
+
 static void test_primary_pass_through(void)
 {
     recovery_engine_t engine;
@@ -566,6 +614,150 @@ static void test_burst_recovery(void)
     assert(memcmp(capture.packets[15], primary_h, TS_PACKET_SIZE) == 0);
     assert(stats.recovered_content_packets == 3);
     assert(stats.recovered_content_bursts == 1);
+    recovery_engine_free(&engine);
+}
+
+static void test_primary_outage_fails_over_to_secondary(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+    uint64_t now_ns;
+    size_t i;
+
+    config.primary_delay_ns = 0;
+    config.primary_outage_ns = 1000000000ULL;
+    config.primary_return_ns = 1000000000ULL;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    for (i = 0; i < 4; i++) {
+        make_packet(packet, 0x120, (uint8_t)i, (uint8_t)(0x20 + i));
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(capture.packet_count == 4);
+    assert(engine.active_output_stream_id == 0);
+    engine.config.primary_outage_ns = 1000000000ULL;
+
+    for (i = 4; i < 9; i++) {
+        make_packet(packet, 0x120, (uint8_t)i, (uint8_t)(0x20 + i));
+        push_packet(&engine, &stats, 1, packet);
+    }
+
+    now_ns = report_stats_now_ns();
+    engine.last_input_arrival_ns[0] = now_ns - 2000000000ULL;
+    engine.last_input_arrival_ns[1] = now_ns;
+    assert(recovery_engine_drain(&engine, false) == 0);
+
+    assert(engine.active_output_stream_id == 1);
+    assert(stats.active_output_stream_id == 1);
+    assert(stats.source_switches[1] == 1);
+    assert(capture.packet_count == 9);
+    for (i = 0; i < 9; i++) {
+        make_packet(packet, 0x120, (uint8_t)i, (uint8_t)(0x20 + i));
+        assert(memcmp(capture.packets[i], packet, TS_PACKET_SIZE) == 0);
+    }
+
+    recovery_engine_free(&engine);
+}
+
+static void test_primary_return_switches_back_after_holdoff(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+    uint64_t now_ns;
+    size_t i;
+
+    config.primary_delay_ns = 0;
+    config.primary_outage_ns = 1000000000ULL;
+    config.primary_return_ns = 0;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    for (i = 0; i < 4; i++) {
+        make_packet(packet, 0x121, (uint8_t)i, (uint8_t)(0x30 + i));
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    for (i = 4; i < 7; i++) {
+        make_packet(packet, 0x121, (uint8_t)i, (uint8_t)(0x30 + i));
+        push_packet(&engine, &stats, 1, packet);
+    }
+
+    now_ns = report_stats_now_ns();
+    engine.config.primary_outage_ns = 1000000000ULL;
+    engine.last_input_arrival_ns[0] = now_ns - 2000000000ULL;
+    engine.last_input_arrival_ns[1] = now_ns;
+    assert(recovery_engine_drain(&engine, false) == 0);
+    assert(engine.active_output_stream_id == 1);
+    assert(capture.packet_count == 7);
+    engine.config.primary_outage_ns = 1000000000ULL;
+
+    for (i = 7; i < 10; i++) {
+        make_packet(packet, 0x121, (uint8_t)i, (uint8_t)(0x30 + i));
+        push_packet(&engine, &stats, 0, packet);
+    }
+    now_ns = report_stats_now_ns();
+    engine.last_input_arrival_ns[0] = now_ns;
+    engine.last_input_arrival_ns[1] = now_ns;
+    assert(recovery_engine_drain(&engine, false) == 0);
+    assert(recovery_engine_drain(&engine, false) == 0);
+
+    assert(engine.active_output_stream_id == 0);
+    assert(stats.active_output_stream_id == 0);
+    assert(stats.source_switches[1] == 1);
+    assert(stats.source_switches[0] == 1);
+    assert(capture.packet_count == 10);
+    for (i = 0; i < 10; i++) {
+        make_packet(packet, 0x121, (uint8_t)i, (uint8_t)(0x30 + i));
+        assert(memcmp(capture.packets[i], packet, TS_PACKET_SIZE) == 0);
+    }
+
+    recovery_engine_free(&engine);
+}
+
+static void test_secondary_outage_keeps_primary_output(void)
+{
+    recovery_engine_config_t config = recovery_engine_default_config();
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t packet[TS_PACKET_SIZE];
+    size_t i;
+
+    config.primary_delay_ns = 0;
+    config.primary_outage_ns = 1000000000ULL;
+    config.min_alignment_confidence = 0;
+    init_engine_with_config(&engine, &stats, &capture, &sink, &config);
+
+    for (i = 0; i < 4; i++) {
+        make_packet(packet, 0x122, (uint8_t)i, (uint8_t)(0x40 + i));
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    for (i = 4; i < 10; i++) {
+        make_packet(packet, 0x122, (uint8_t)i, (uint8_t)(0x40 + i));
+        push_packet(&engine, &stats, 0, packet);
+    }
+
+    assert(engine.active_output_stream_id == 0);
+    assert(stats.source_switches[0] == 0);
+    assert(stats.source_switches[1] == 0);
+    assert(capture.packet_count == 10);
+    for (i = 0; i < 10; i++) {
+        make_packet(packet, 0x122, (uint8_t)i, (uint8_t)(0x40 + i));
+        assert(memcmp(capture.packets[i], packet, TS_PACKET_SIZE) == 0);
+    }
+
     recovery_engine_free(&engine);
 }
 
@@ -1370,9 +1562,13 @@ int main(void)
     test_ts_packet_parse();
     test_ts_packet_parse_edges();
     test_report_stats_observe_edges();
+    test_report_stats_health_recovers_after_quiet_window();
     test_primary_pass_through();
     test_single_packet_recovery();
     test_burst_recovery();
+    test_primary_outage_fails_over_to_secondary();
+    test_primary_return_switches_back_after_holdoff();
+    test_secondary_outage_keeps_primary_output();
     test_counter_fallback_recovery_without_anchor();
     test_stream_time_range_recovery();
     test_stream_time_range_skips_primary_boundary_twin();

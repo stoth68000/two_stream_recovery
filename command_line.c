@@ -59,6 +59,14 @@ void command_line_print_usage(const char *program_name)
             "      Rolling packet history target, used to size primary and secondary buffers.\n"
             "      Default: %llu\n"
             "\n"
+            "  --primary-outage-ms <ms>\n"
+            "      Silence on stream #1 before output fails over to stream #2.\n"
+            "      Default: %llu\n"
+            "\n"
+            "  --primary-return-ms <ms>\n"
+            "      Healthy stream #1 warm-up time before returning from stream #2.\n"
+            "      Default: %llu\n"
+            "\n"
             "  --max-content-burst-packets <count>\n"
             "      Maximum content packets to recover in one conservative burst.\n"
             "      Default: %u\n"
@@ -75,6 +83,8 @@ void command_line_print_usage(const char *program_name)
             (unsigned long long)(defaults.max_secondary_latency_ns / 1000000ULL),
             (unsigned long long)(defaults.alignment_window_ns / 1000000ULL),
             (unsigned long long)defaults.history_ms,
+            (unsigned long long)(defaults.primary_outage_ns / 1000000ULL),
+            (unsigned long long)(defaults.primary_return_ns / 1000000ULL),
             defaults.max_content_burst_packets,
             defaults.min_alignment_confidence);
 }
@@ -191,6 +201,10 @@ static int command_line_parse_internal(int argc, char **argv, command_line_optio
             ms_target_ns = &options->recovery_config.alignment_window_ns;
         } else if (strcmp(name, "--history-ms") == 0) {
             u64_target = &options->recovery_config.history_ms;
+        } else if (strcmp(name, "--primary-outage-ms") == 0) {
+            ms_target_ns = &options->recovery_config.primary_outage_ns;
+        } else if (strcmp(name, "--primary-return-ms") == 0) {
+            ms_target_ns = &options->recovery_config.primary_return_ns;
         } else if (strcmp(name, "--max-content-burst-packets") == 0) {
             u32_target = &options->recovery_config.max_content_burst_packets;
             u32_max = 255U;

@@ -90,6 +90,8 @@ A more complete command with the web UI enabled:
   --max-secondary-latency-ms 5000 \
   --alignment-window-ms 6000 \
   --history-ms 12000 \
+  --primary-outage-ms 500 \
+  --primary-return-ms 120000 \
   --max-content-burst-packets 255 \
   --min-alignment-confidence 0 \
   --http-port 4500
@@ -158,6 +160,15 @@ Arrival-time search window used while comparing packets for stream alignment.
 `--history-ms <ms>`  
 Rolling packet history target used to size recovery buffers.
 
+`--primary-outage-ms <ms>`  
+Silence on stream #1 before output fails over to stream #2. The default is
+500 ms.
+
+`--primary-return-ms <ms>`  
+Healthy stream #1 warm-up time before returning from stream #2. The default is
+120000 ms, so primary has to be back for two quiet minutes before it is
+preferred again.
+
 `--max-content-burst-packets <count>`  
 Maximum number of content packets to recover in one conservative burst.
 
@@ -223,4 +234,3 @@ Multicast UDP inputs automatically join the configured groups with IGMP.
 - `web_server.c/h` - embedded REST/static web server
 - `webroot/` - HTML, CSS, JavaScript, and UI assets
 - `tests/` - unit and soak tests
-

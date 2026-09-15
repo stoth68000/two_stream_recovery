@@ -190,6 +190,10 @@ static int output_record(recovery_engine_t *engine, const packet_record_t *recor
     }
 
     engine->stats->output_packets++;
+    if (record->source_stream_id >= 0 && record->source_stream_id < 2) {
+        engine->has_output_stream_index[record->source_stream_id] = true;
+        engine->last_output_stream_index[record->source_stream_id] = record->stream_index;
+    }
     if (engine->stats->output_packets % OUTPUT_TS_PACKETS_PER_DATAGRAM == 0) {
         report_stats_observe_output_datagram(engine->stats, false);
     }
@@ -608,6 +612,207 @@ static uint64_t apply_time_offset(uint64_t value, int64_t offset)
     }
 
     return value + (uint64_t)offset;
+}
+
+static uint64_t secondary_release_delay_ns(recovery_engine_t *engine)
+{
+    int64_t observed_latency_ns = estimated_secondary_time_offset_ns(engine);
+    uint64_t latency_ns = 0;
+
+    if (observed_latency_ns > 0) {
+        latency_ns = (uint64_t)observed_latency_ns;
+    }
+    if (latency_ns >= engine->config.primary_delay_ns) {
+        return 0;
+    }
+    return engine->config.primary_delay_ns - latency_ns;
+}
+
+static void set_active_output_stream(recovery_engine_t *engine, int stream_id)
+{
+    int previous_stream_id = engine->active_output_stream_id;
+
+    if (engine->active_output_stream_id == stream_id) {
+        return;
+    }
+
+    engine->active_output_stream_id = stream_id;
+    engine->stats->active_output_stream_id = stream_id;
+    engine->stats->source_switches[stream_id]++;
+    if (stream_id == 1) {
+        engine->primary_return_start_ns = 0;
+        engine->primary_switchback_guard = false;
+    } else if (previous_stream_id == 1) {
+        engine->primary_switchback_guard = true;
+    }
+}
+
+static void prune_secondary_queue_through(recovery_engine_t *engine, uint64_t secondary_index)
+{
+    while (engine->secondary_queue.count > 0) {
+        packet_record_t *record = primary_delay_queue_front(&engine->secondary_queue);
+        if (record == NULL || record->stream_index > secondary_index) {
+            break;
+        }
+        primary_delay_queue_pop(&engine->secondary_queue);
+    }
+}
+
+static bool primary_record_already_covered_by_secondary(recovery_engine_t *engine,
+                                                        const packet_record_t *primary)
+{
+    int64_t secondary_index;
+
+    if (!engine->has_output_stream_index[1] || !engine->alignment.has_alignment) {
+        return false;
+    }
+
+    secondary_index = (int64_t)primary->stream_index + engine->alignment.offset_packets;
+    if (secondary_index < 0) {
+        return false;
+    }
+
+    return (uint64_t)secondary_index <= engine->last_output_stream_index[1];
+}
+
+static void prune_primary_queue_covered_by_secondary(recovery_engine_t *engine)
+{
+    while (engine->primary_queue.count > 0) {
+        packet_record_t *record = primary_delay_queue_front(&engine->primary_queue);
+        if (record == NULL) {
+            break;
+        }
+        if (record_fits_next_output(engine, record)) {
+            break;
+        }
+        if (!primary_record_already_covered_by_secondary(engine, record)) {
+            break;
+        }
+        primary_delay_queue_pop(&engine->primary_queue);
+    }
+}
+
+static void prune_queue_until_next_output(recovery_engine_t *engine, primary_delay_queue_t *queue)
+{
+    while (queue->count > 0) {
+        packet_record_t *record = primary_delay_queue_front(queue);
+        if (record == NULL || record_fits_next_output(engine, record)) {
+            break;
+        }
+        primary_delay_queue_pop(queue);
+    }
+}
+
+static void prune_due_primary_backlog(recovery_engine_t *engine, uint64_t now_ns)
+{
+    if (engine->config.primary_delay_ns == 0) {
+        return;
+    }
+
+    while (engine->primary_queue.count > 0) {
+        packet_record_t *record = primary_delay_queue_front(&engine->primary_queue);
+        if (record == NULL ||
+            record->arrival_time_ns > now_ns ||
+            now_ns - record->arrival_time_ns < engine->config.primary_delay_ns) {
+            break;
+        }
+        primary_delay_queue_pop(&engine->primary_queue);
+    }
+}
+
+static bool stream_has_recent_input(recovery_engine_t *engine, int stream_id, uint64_t now_ns,
+                                    uint64_t quiet_ns)
+{
+    return engine->last_input_arrival_ns[stream_id] != 0 &&
+           now_ns >= engine->last_input_arrival_ns[stream_id] &&
+           now_ns - engine->last_input_arrival_ns[stream_id] <= quiet_ns;
+}
+
+static bool failover_is_allowed(recovery_engine_t *engine)
+{
+    if (engine->secondary_queue.count == 0) {
+        return false;
+    }
+    if (!engine->alignment.has_alignment) {
+        return false;
+    }
+    return engine->alignment.confidence >= engine->config.min_alignment_confidence / 2U;
+}
+
+static void maybe_update_active_source(recovery_engine_t *engine, uint64_t now_ns)
+{
+    bool primary_recent = stream_has_recent_input(engine, 0, now_ns, engine->config.primary_outage_ns);
+    bool secondary_recent = stream_has_recent_input(engine, 1, now_ns, engine->config.primary_outage_ns);
+
+    if (engine->active_output_stream_id == 0) {
+        if (!primary_recent && secondary_recent && failover_is_allowed(engine)) {
+            if (engine->last_primary_anchor.valid) {
+                prune_secondary_queue_through(engine, engine->last_primary_anchor.secondary_index);
+            }
+            prune_queue_until_next_output(engine, &engine->secondary_queue);
+            set_active_output_stream(engine, 1);
+        }
+        return;
+    }
+
+    prune_primary_queue_covered_by_secondary(engine);
+    if (!secondary_recent && engine->primary_queue.count > 0) {
+        prune_due_primary_backlog(engine, now_ns);
+        prune_queue_until_next_output(engine, &engine->primary_queue);
+        if (engine->primary_queue.count == 0) {
+            return;
+        }
+        set_active_output_stream(engine, 0);
+        return;
+    }
+
+    if (!primary_recent || engine->primary_queue.count == 0) {
+        engine->primary_return_start_ns = 0;
+        return;
+    }
+    if (engine->primary_return_start_ns == 0) {
+        engine->primary_return_start_ns = now_ns;
+        return;
+    }
+    if (now_ns - engine->primary_return_start_ns >= engine->config.primary_return_ns) {
+        prune_due_primary_backlog(engine, now_ns);
+        prune_queue_until_next_output(engine, &engine->primary_queue);
+        if (engine->primary_queue.count > 0) {
+            set_active_output_stream(engine, 0);
+        }
+    }
+}
+
+static int drain_secondary_failover(recovery_engine_t *engine, bool force)
+{
+    uint64_t now_ns = report_stats_now_ns();
+    uint64_t release_delay_ns = secondary_release_delay_ns(engine);
+
+    while (engine->secondary_queue.count > 0) {
+        packet_record_t *record = primary_delay_queue_front(&engine->secondary_queue);
+
+        if (record == NULL) {
+            break;
+        }
+        if (engine->last_primary_anchor.valid &&
+            record->stream_index <= engine->last_primary_anchor.secondary_index) {
+            primary_delay_queue_pop(&engine->secondary_queue);
+            continue;
+        }
+        if (!force && now_ns - record->arrival_time_ns < release_delay_ns) {
+            break;
+        }
+        if (!record_fits_next_output(engine, record)) {
+            primary_delay_queue_pop(&engine->secondary_queue);
+            continue;
+        }
+        if (output_record(engine, record) != 0) {
+            return -1;
+        }
+        primary_delay_queue_pop(&engine->secondary_queue);
+    }
+
+    return 0;
 }
 
 static int recover_secondary_time_range(recovery_engine_t *engine,
@@ -1182,6 +1387,8 @@ recovery_engine_config_t recovery_engine_default_config(void)
     config.max_secondary_latency_ns = RECOVERY_ENGINE_DEFAULT_MAX_SECONDARY_LATENCY_NS;
     config.alignment_window_ns = RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS;
     config.history_ms = RECOVERY_ENGINE_DEFAULT_HISTORY_MS;
+    config.primary_outage_ns = RECOVERY_ENGINE_DEFAULT_PRIMARY_OUTAGE_NS;
+    config.primary_return_ns = RECOVERY_ENGINE_DEFAULT_PRIMARY_RETURN_NS;
     config.min_alignment_confidence = RECOVERY_ENGINE_DEFAULT_MIN_ALIGNMENT_CONFIDENCE;
     config.max_content_burst_packets = RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS;
     return config;
@@ -1239,6 +1446,16 @@ int recovery_engine_init_with_config(recovery_engine_t *engine, packet_sink_t *s
         packet_history_free(&engine->history[0]);
         return -1;
     }
+    if (primary_delay_queue_init(&engine->secondary_queue, history_capacity_from_config(&engine->config),
+                                 engine->config.primary_delay_ns) != 0) {
+        primary_delay_queue_free(&engine->primary_queue);
+        packet_history_free(&engine->history[1]);
+        packet_history_free(&engine->history[0]);
+        return -1;
+    }
+
+    engine->active_output_stream_id = 0;
+    engine->stats->active_output_stream_id = 0;
 
     return 0;
 }
@@ -1267,6 +1484,7 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
     record->pcr_value = info->has_pcr ? packet_info_pcr_value(info) : 0;
     record->hash = hash_packet(packet);
     memcpy(record->packet, packet, TS_PACKET_SIZE);
+    engine->last_input_arrival_ns[stream_id] = record->arrival_time_ns;
 
     update_pcr_timing(engine, stream_id, record);
     update_alignment(engine, stream_id, record);
@@ -1282,12 +1500,25 @@ int recovery_engine_push_packet(recovery_engine_t *engine, int stream_id, const 
             return -1;
         }
     }
+    if (stream_id == 1 && primary_delay_queue_push(&engine->secondary_queue, record) != 0) {
+        primary_delay_queue_pop(&engine->secondary_queue);
+        if (primary_delay_queue_push(&engine->secondary_queue, record) != 0) {
+            return -1;
+        }
+    }
 
     return recovery_engine_drain(engine, false);
 }
 
 int recovery_engine_drain(recovery_engine_t *engine, bool force)
 {
+    maybe_update_active_source(engine, report_stats_now_ns());
+
+    if (engine->active_output_stream_id == 1) {
+        prune_primary_queue_covered_by_secondary(engine);
+        return drain_secondary_failover(engine, force);
+    }
+
     while (engine->primary_queue.count > 0) {
         uint64_t now_ns = report_stats_now_ns();
         packet_record_t *record = primary_delay_queue_front(&engine->primary_queue);
@@ -1316,9 +1547,17 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 
         diagnose_secondary_loss_before_primary(engine, record, secondary_match);
 
+        if (engine->primary_switchback_guard &&
+            !record_fits_next_output(engine, record)) {
+            report_stats_reject_recovery(engine->stats, RECOVERY_REJECT_WRONG_COUNTER);
+            engine->stats->unrecoverable_loss++;
+            primary_delay_queue_pop(&engine->primary_queue);
+            continue;
+        }
         if (output_record(engine, record) != 0) {
             return -1;
         }
+        engine->primary_switchback_guard = false;
         engine->primary_gap.valid = true;
         engine->primary_gap.arrival_time_ns = record->arrival_time_ns;
         engine->primary_gap.continuity_errors = record->stream_continuity_errors;
@@ -1326,6 +1565,7 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             engine->last_primary_anchor.valid = true;
             engine->last_primary_anchor.primary_index = record->stream_index;
             engine->last_primary_anchor.secondary_index = secondary_match->stream_index;
+            prune_secondary_queue_through(engine, secondary_match->stream_index);
         }
         primary_delay_queue_pop(&engine->primary_queue);
     }
@@ -1343,6 +1583,7 @@ int recovery_engine_flush(recovery_engine_t *engine)
 
 void recovery_engine_free(recovery_engine_t *engine)
 {
+    primary_delay_queue_free(&engine->secondary_queue);
     primary_delay_queue_free(&engine->primary_queue);
     packet_history_free(&engine->history[0]);
     packet_history_free(&engine->history[1]);

@@ -185,6 +185,7 @@ static int run_loop(input_udp_t inputs[2], output_udp_t *output,
             web_server_close(&web_server);
             return -1;
         }
+        report_stats_tick(&stats);
         if (console_report) {
             report_stats_maybe_print(&stats, false);
         }

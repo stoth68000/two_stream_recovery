@@ -17,6 +17,8 @@
 #define RECOVERY_ENGINE_DEFAULT_ALIGNMENT_WINDOW_NS 6000000000ULL
 #define RECOVERY_ENGINE_DEFAULT_HISTORY_MS 6000ULL
 #define RECOVERY_ENGINE_DEFAULT_MIN_ALIGNMENT_CONFIDENCE 40U
+#define RECOVERY_ENGINE_DEFAULT_PRIMARY_OUTAGE_NS 500000000ULL
+#define RECOVERY_ENGINE_DEFAULT_PRIMARY_RETURN_NS 120000000000ULL
 #define RECOVERY_ENGINE_MAX_PCR_PIDS 32
 #define RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS 15U
 #define RECOVERY_ENGINE_STREAM_GAP_MIN_NS 10000000ULL
@@ -31,6 +33,8 @@ typedef struct recovery_engine_config {
     uint64_t max_secondary_latency_ns;
     uint64_t alignment_window_ns;
     uint64_t history_ms;
+    uint64_t primary_outage_ns;
+    uint64_t primary_return_ns;
     uint32_t min_alignment_confidence;
     uint32_t max_content_burst_packets;
 } recovery_engine_config_t;
@@ -121,8 +125,15 @@ typedef struct recovery_engine {
     recovery_engine_config_t config;
     packet_history_t history[2];
     primary_delay_queue_t primary_queue;
+    primary_delay_queue_t secondary_queue;
     pcr_timing_model_t pcr_model[2];
     uint64_t next_stream_index[2];
+    uint64_t last_input_arrival_ns[2];
+    uint64_t last_output_stream_index[2];
+    bool has_output_stream_index[2];
+    int active_output_stream_id;
+    uint64_t primary_return_start_ns;
+    bool primary_switchback_guard;
     alignment_state_t alignment;
     primary_anchor_t last_primary_anchor;
     primary_gap_state_t primary_gap;
