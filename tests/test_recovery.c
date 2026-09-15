@@ -1,9 +1,9 @@
-#include "../command_line.h"
-#include "../input_udp.h"
-#include "../output_udp.h"
-#include "../recovery_engine.h"
-#include "../report_stats.h"
-#include "../ts_packet.h"
+#include "command_line.h"
+#include "input_udp.h"
+#include "output_udp.h"
+#include "recovery_engine.h"
+#include "report_stats.h"
+#include "ts_packet.h"
 
 #include <assert.h>
 #include <stdint.h>

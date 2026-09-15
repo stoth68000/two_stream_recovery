@@ -1,7 +1,7 @@
-#include "../packet_sink.h"
-#include "../recovery_engine.h"
-#include "../report_stats.h"
-#include "../ts_packet.h"
+#include "packet_sink.h"
+#include "recovery_engine.h"
+#include "report_stats.h"
+#include "ts_packet.h"
 
 #include <assert.h>
 #include <stdint.h>

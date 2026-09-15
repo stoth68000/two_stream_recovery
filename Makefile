@@ -1,13 +1,13 @@
 CC ?= cc
-CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
+CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -Isrc
 LDFLAGS ?=
 
 BIN := two_stream_recovery
-OBJS := main.o command_line.o input_udp.o output_udp.o report_stats.o ts_packet.o recovery_engine.o web_server.o
+OBJS := src/main.o src/command_line.o src/input_udp.o src/output_udp.o src/report_stats.o src/ts_packet.o src/recovery_engine.o src/web_server.o
 TEST_BIN := tests/test_recovery
-TEST_OBJS := tests/test_recovery.o command_line.o input_udp.o output_udp.o report_stats.o ts_packet.o recovery_engine.o web_server.o
+TEST_OBJS := tests/test_recovery.o src/command_line.o src/input_udp.o src/output_udp.o src/report_stats.o src/ts_packet.o src/recovery_engine.o src/web_server.o
 SOAK_BIN := tests/soak_replay
-SOAK_OBJS := tests/soak_replay.o report_stats.o ts_packet.o recovery_engine.o
+SOAK_OBJS := tests/soak_replay.o src/report_stats.o src/ts_packet.o src/recovery_engine.o
 
 .PHONY: all clean test live-test soak-test
 

@@ -1,4 +1,11 @@
 *.o
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+Testing/
+build/
 two_stream_recovery
 tests/test_recovery
 tests/soak_replay

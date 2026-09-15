@@ -36,31 +36,32 @@ switching.
 Requirements:
 
 - A C11 compiler such as `cc` or `clang`
-- `make`
+- CMake 3.16 or newer
 - POSIX sockets support
 
 Build the tool:
 
 ```sh
-make
+cmake -S . -B build
+cmake --build build
 ```
 
 Run the unit test suite:
 
 ```sh
-make test
+ctest --test-dir build --output-on-failure
 ```
 
-Run the soak replay test:
+Run an individual test:
 
 ```sh
-make soak-test
+ctest --test-dir build -R soak_replay --output-on-failure
 ```
 
 Clean build products:
 
 ```sh
-make clean
+cmake --build build --target clean
 ```
 
 ## Basic Usage
@@ -111,10 +112,10 @@ http://127.0.0.1:4500/api/stats
 
 ## Live Test Target
 
-For local development, the Makefile provides:
+For local development, CMake provides:
 
 ```sh
-make live-test
+cmake --build build --target live-test
 ```
 
 This starts the tool with:
@@ -225,12 +226,12 @@ Multicast UDP inputs automatically join the configured groups with IGMP.
 
 ## Project Layout
 
-- `main.c` - process loop and socket polling
-- `command_line.c/h` - command-line parsing
-- `input_udp.c/h` - UDP input and multicast join handling
-- `output_udp.c/h` - fixed-size UDP MPEG-TS output
-- `recovery_engine.c/h` - stream alignment, buffering, and recovery decisions
-- `report_stats.c/h` - counters, rolling windows, JSON, and console reporting
-- `web_server.c/h` - embedded REST/static web server
+- `src/main.c` - process loop and socket polling
+- `src/command_line.c/h` - command-line parsing
+- `src/input_udp.c/h` - UDP input and multicast join handling
+- `src/output_udp.c/h` - fixed-size UDP MPEG-TS output
+- `src/recovery_engine.c/h` - stream alignment, buffering, and recovery decisions
+- `src/report_stats.c/h` - counters, rolling windows, JSON, and console reporting
+- `src/web_server.c/h` - embedded REST/static web server
 - `webroot/` - HTML, CSS, JavaScript, and UI assets
 - `tests/` - unit and soak tests
