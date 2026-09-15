@@ -684,12 +684,77 @@ static bool primary_is_silent_beyond_outage(const recovery_engine_t *engine, uin
     return now_ns - engine->last_input_arrival_ns[0] >= engine->config.primary_outage_ns;
 }
 
+static void discard_secondary_records_through(recovery_engine_t *engine, uint64_t stream_index)
+{
+    while (engine->secondary_queue.count > 0) {
+        packet_record_t *secondary = delay_queue_front(&engine->secondary_queue);
+
+        if (secondary == NULL || secondary->stream_index > stream_index) {
+            break;
+        }
+        delay_queue_pop(&engine->secondary_queue);
+    }
+}
+
+static void discard_secondary_records_already_output_by_primary(recovery_engine_t *engine)
+{
+    uint64_t cutoff = 0;
+    bool has_cutoff = false;
+
+    if (engine->last_primary_anchor.valid) {
+        cutoff = engine->last_primary_anchor.secondary_index;
+        has_cutoff = true;
+    }
+    if (engine->alignment.has_alignment && engine->has_output_stream_index[0]) {
+        int64_t secondary_index = (int64_t)engine->last_output_stream_index[0] +
+                                  engine->alignment.offset_packets;
+
+        if (secondary_index >= 0 &&
+            (!has_cutoff || (uint64_t)secondary_index > cutoff)) {
+            cutoff = (uint64_t)secondary_index;
+            has_cutoff = true;
+        }
+    }
+    if (!has_cutoff) {
+        return;
+    }
+    discard_secondary_records_through(engine, cutoff);
+}
+
+static bool primary_record_already_output_by_secondary(const recovery_engine_t *engine,
+                                                       const packet_record_t *primary)
+{
+    int64_t secondary_index;
+
+    if (!engine->alignment.has_alignment || !engine->has_output_stream_index[1]) {
+        return false;
+    }
+    secondary_index = (int64_t)primary->stream_index + engine->alignment.offset_packets;
+    return secondary_index >= 0 &&
+           (uint64_t)secondary_index <= engine->last_output_stream_index[1];
+}
+
+static void discard_primary_records_already_output_by_secondary(recovery_engine_t *engine)
+{
+    while (engine->primary_queue.count > 0) {
+        packet_record_t *primary = delay_queue_front(&engine->primary_queue);
+
+        if (primary == NULL ||
+            !primary_record_already_output_by_secondary(engine, primary)) {
+            break;
+        }
+        delay_queue_pop(&engine->primary_queue);
+    }
+}
+
 static int drain_secondary_on_primary_outage(recovery_engine_t *engine, bool force, uint64_t now_ns)
 {
     if (engine->active_output_stream_id != 1 &&
         !primary_is_silent_beyond_outage(engine, now_ns)) {
         return 0;
     }
+
+    discard_secondary_records_already_output_by_primary(engine);
 
     while (engine->secondary_queue.count > 0) {
         packet_record_t *secondary = delay_queue_front(&engine->secondary_queue);
@@ -707,6 +772,9 @@ static int drain_secondary_on_primary_outage(recovery_engine_t *engine, bool for
             return -1;
         }
         delay_queue_pop(&engine->secondary_queue);
+        if (!force) {
+            break;
+        }
     }
 
     return 0;
@@ -2063,12 +2131,17 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         !primary_return_holdoff_elapsed(engine, now_ns)) {
         return drain_secondary_on_primary_outage(engine, force, now_ns);
     }
+    discard_primary_records_already_output_by_secondary(engine);
+    if (engine->primary_queue.count == 0) {
+        return drain_secondary_on_primary_outage(engine, force, now_ns);
+    }
     set_active_output_stream(engine, 0);
 
     while (engine->primary_queue.count > 0) {
         packet_record_t *primary = delay_queue_front(&engine->primary_queue);
         secondary_after_anchor_candidates_t secondary_matches;
         packet_record_t *single_secondary_match = NULL;
+        packet_record_t *anchor_secondary_match = NULL;
         bool primary_fits;
         bool logged_recovery_decision = false;
         bool inserted_recovery = false;
@@ -2092,6 +2165,10 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         engine->decision_candidates_truncated = secondary_matches.truncated;
         if (secondary_matches.count == 1 && !secondary_matches.truncated) {
             single_secondary_match = secondary_matches.records[0];
+        }
+        anchor_secondary_match = single_secondary_match;
+        if (anchor_secondary_match == NULL && engine->alignment.has_alignment) {
+            anchor_secondary_match = find_aligned_secondary_record(engine, primary);
         }
         primary_fits = record_fits_next_output(engine, primary);
         if (primary->transport_error) {
@@ -2187,7 +2264,7 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         if (output_record(engine, primary) != 0) {
             return -1;
         }
-        update_primary_anchor(engine, primary, single_secondary_match);
+        update_primary_anchor(engine, primary, anchor_secondary_match);
         engine->primary_gap.valid = true;
         engine->primary_gap.arrival_time_ns = primary->arrival_time_ns;
         engine->primary_gap.continuity_errors = primary->stream_continuity_errors;
