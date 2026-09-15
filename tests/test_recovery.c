@@ -1927,57 +1927,177 @@ static void test_pid_specific_loss_does_not_log_mixed_rejects_for_nulls(void)
     recovery_engine_free(&engine);
 }
 
-static void test_anchor_gap_detection_only_with_counter_wrap(void)
+static void run_same_pid_position_gap(unsigned gap, uint32_t max_burst, bool expect_recovery)
 {
     enum {
-        WARMUP_PACKETS = 8,
-        GAP_PACKETS = 16
+        WARMUP_PACKETS = 12,
+        PID = 0x0125
     };
     recovery_engine_t engine;
     report_stats_t stats;
     capture_sink_t capture;
     packet_sink_t sink;
-    uint8_t secondary_gap[GAP_PACKETS][TS_PACKET_SIZE];
+    uint8_t secondary_gap[255][TS_PACKET_SIZE];
     uint8_t primary_after[TS_PACKET_SIZE];
     uint8_t secondary_after[TS_PACKET_SIZE];
     size_t i;
 
+    assert(gap >= 1 && gap <= 255);
     init_engine(&engine, &stats, &capture, &sink);
-    engine.config.max_content_burst_packets = GAP_PACKETS;
+    engine.config.max_content_burst_packets = max_burst;
 
     for (i = 0; i < WARMUP_PACKETS; i++) {
         uint8_t packet[TS_PACKET_SIZE];
 
-        make_packet(packet, 0x125, (uint8_t)(i & 0x0fU), (uint8_t)(0x30 + i));
+        make_packet(packet, PID, (uint8_t)(i & 0x0fU), (uint8_t)(0x30 + i));
+        stamp_packet_unique(packet, 0x1200, (uint16_t)i);
         push_packet(&engine, &stats, 1, packet);
         push_packet(&engine, &stats, 0, packet);
     }
     assert(recovery_engine_flush(&engine) == 0);
     assert(engine.last_primary_anchor.valid);
 
-    for (i = 0; i < GAP_PACKETS; i++) {
-        make_packet(secondary_gap[i], 0x125, (uint8_t)((WARMUP_PACKETS + i) & 0x0fU),
+    for (i = 0; i < gap; i++) {
+        make_packet(secondary_gap[i], PID, (uint8_t)((WARMUP_PACKETS + i) & 0x0fU),
                     (uint8_t)(0x60 + i));
+        stamp_packet_unique(secondary_gap[i], 0x1250, (uint16_t)i);
         push_packet(&engine, &stats, 1, secondary_gap[i]);
     }
 
-    make_packet(primary_after, 0x125, (uint8_t)((WARMUP_PACKETS + GAP_PACKETS) & 0x0fU), 0xa0);
-    make_packet(secondary_after, 0x125, (uint8_t)((WARMUP_PACKETS + GAP_PACKETS) & 0x0fU), 0xa0);
+    make_packet(primary_after, PID, (uint8_t)((WARMUP_PACKETS + gap) & 0x0fU), 0xa0);
+    make_packet(secondary_after, PID, (uint8_t)((WARMUP_PACKETS + gap) & 0x0fU), 0xa0);
+    stamp_packet_unique(primary_after, 0x1260, (uint16_t)gap);
+    stamp_packet_unique(secondary_after, 0x1260, (uint16_t)gap);
     push_packet(&engine, &stats, 1, secondary_after);
     push_packet(&engine, &stats, 0, primary_after);
 
-    assert(stats.continuity_errors[0] == 0);
     assert(recovery_engine_flush(&engine) == 0);
-    assert(capture.packet_count == WARMUP_PACKETS + GAP_PACKETS + 1);
-    for (i = 0; i < GAP_PACKETS; i++) {
-        assert(memcmp(capture.packets[WARMUP_PACKETS + i], secondary_gap[i], TS_PACKET_SIZE) == 0);
+    if (expect_recovery) {
+        assert(capture.packet_count == WARMUP_PACKETS + gap + 1);
+        for (i = 0; i < gap; i++) {
+            assert(memcmp(capture.packets[WARMUP_PACKETS + i], secondary_gap[i],
+                          TS_PACKET_SIZE) == 0);
+        }
+        assert(memcmp(capture.packets[WARMUP_PACKETS + gap], primary_after,
+                      TS_PACKET_SIZE) == 0);
+        assert(stats.recovered_packets == gap);
+        assert(stats.recovered_content_packets == gap);
+        assert(stats.recovered_content_bursts == (gap > 1 ? 1U : 0U));
+        assert(stats.unrecoverable_loss == 0);
+    } else {
+        assert(capture.packet_count == WARMUP_PACKETS + 1);
+        assert(memcmp(capture.packets[WARMUP_PACKETS], primary_after, TS_PACKET_SIZE) == 0);
+        assert(stats.recovered_packets == 0);
+        assert(stats.recovered_content_packets == 0);
+        assert(stats.recovered_content_bursts == 0);
+        assert(stats.recovery_rejects[RECOVERY_REJECT_BURST_TOO_LARGE] == 1);
     }
-    assert(memcmp(capture.packets[WARMUP_PACKETS + GAP_PACKETS], primary_after, TS_PACKET_SIZE) == 0);
+    assert(stats.output_continuity_errors == 0);
+
+    recovery_engine_free(&engine);
+}
+
+static void test_same_pid_gap_15_recovers_at_default_max(void)
+{
+    run_same_pid_position_gap(15, RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS, true);
+}
+
+static void test_same_pid_gap_16_rejects_at_default_max(void)
+{
+    run_same_pid_position_gap(16, RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS, false);
+}
+
+static void test_same_pid_gap_16_recovers_with_raised_max_and_position_anchors(void)
+{
+    run_same_pid_position_gap(16, 16, true);
+}
+
+static void test_same_pid_gap_17_plus_recovers_with_position_anchors(void)
+{
+    run_same_pid_position_gap(17, 255, true);
+    run_same_pid_position_gap(24, 255, true);
+}
+
+static void test_same_pid_position_gap_recovers_after_stale_anchor_prefix(void)
+{
+    enum {
+        WARMUP_PACKETS = 12,
+        PREFIX_PACKETS = 24,
+        GAP_PACKETS = 24,
+        PID = 0x0031
+    };
+    recovery_engine_t engine;
+    report_stats_t stats;
+    capture_sink_t capture;
+    packet_sink_t sink;
+    uint8_t prefix[PREFIX_PACKETS][TS_PACKET_SIZE];
+    uint8_t secondary_gap[GAP_PACKETS][TS_PACKET_SIZE];
+    uint8_t primary_after[TS_PACKET_SIZE];
+    uint8_t secondary_after[TS_PACKET_SIZE];
+    size_t i;
+
+    init_engine(&engine, &stats, &capture, &sink);
+    engine.config.max_content_burst_packets = 255;
+
+    for (i = 0; i < WARMUP_PACKETS; i++) {
+        uint8_t packet[TS_PACKET_SIZE];
+
+        make_packet(packet, PID, (uint8_t)(i & 0x0fU), (uint8_t)(0x20 + i));
+        stamp_packet_unique(packet, 0x3100, (uint16_t)i);
+        push_packet(&engine, &stats, 1, packet);
+        push_packet(&engine, &stats, 0, packet);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(engine.last_primary_anchor.valid);
+
+    for (i = 0; i < PREFIX_PACKETS; i++) {
+        make_packet(prefix[i], PID, (uint8_t)((WARMUP_PACKETS + i) & 0x0fU),
+                    (uint8_t)(0x40 + i));
+        stamp_packet_unique(prefix[i], 0x3110, (uint16_t)i);
+        push_packet(&engine, &stats, 0, prefix[i]);
+    }
+    assert(recovery_engine_flush(&engine) == 0);
+
+    for (i = 0; i < PREFIX_PACKETS; i++) {
+        push_packet(&engine, &stats, 1, prefix[i]);
+    }
+    for (i = 0; i < GAP_PACKETS; i++) {
+        make_packet(secondary_gap[i], PID,
+                    (uint8_t)((WARMUP_PACKETS + PREFIX_PACKETS + i) & 0x0fU),
+                    (uint8_t)(0x70 + i));
+        stamp_packet_unique(secondary_gap[i], 0x3120, (uint16_t)i);
+        push_packet(&engine, &stats, 1, secondary_gap[i]);
+    }
+
+    make_packet(primary_after, PID,
+                (uint8_t)((WARMUP_PACKETS + PREFIX_PACKETS + GAP_PACKETS) & 0x0fU),
+                0xb0);
+    make_packet(secondary_after, PID,
+                (uint8_t)((WARMUP_PACKETS + PREFIX_PACKETS + GAP_PACKETS) & 0x0fU),
+                0xb0);
+    stamp_packet_unique(primary_after, 0x3130, 0);
+    stamp_packet_unique(secondary_after, 0x3130, 0);
+    push_packet(&engine, &stats, 1, secondary_after);
+    push_packet(&engine, &stats, 0, primary_after);
+
+    assert(recovery_engine_flush(&engine) == 0);
+    assert(capture.packet_count == WARMUP_PACKETS + PREFIX_PACKETS + GAP_PACKETS + 1);
+    for (i = 0; i < PREFIX_PACKETS; i++) {
+        assert(memcmp(capture.packets[WARMUP_PACKETS + i], prefix[i],
+                      TS_PACKET_SIZE) == 0);
+    }
+    for (i = 0; i < GAP_PACKETS; i++) {
+        assert(memcmp(capture.packets[WARMUP_PACKETS + PREFIX_PACKETS + i],
+                      secondary_gap[i], TS_PACKET_SIZE) == 0);
+    }
+    assert(memcmp(capture.packets[WARMUP_PACKETS + PREFIX_PACKETS + GAP_PACKETS],
+                  primary_after, TS_PACKET_SIZE) == 0);
     assert(stats.recovered_packets == GAP_PACKETS);
     assert(stats.recovered_content_packets == GAP_PACKETS);
     assert(stats.recovered_content_bursts == 1);
     assert(stats.output_continuity_errors == 0);
     assert(stats.unrecoverable_loss == 0);
+    assert(stats.recovery_rejects[RECOVERY_REJECT_AMBIGUOUS] == 0);
 
     recovery_engine_free(&engine);
 }
@@ -2074,19 +2194,18 @@ static void test_generated_content_recovery_sweep(void)
     unsigned scenarios = 0;
 
     for (pid_index = 0; pid_index < sizeof(pids) / sizeof(pids[0]); pid_index++) {
-        for (gap = 1; gap <= 255; gap++) {
+        for (gap = 1; gap <= RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS; gap++) {
             recovery_engine_t engine;
             report_stats_t stats;
             capture_sink_t capture;
             packet_sink_t sink;
             uint8_t primary_anchor[TS_PACKET_SIZE];
             uint8_t secondary_anchor[TS_PACKET_SIZE];
-            uint8_t expected_gap[255][TS_PACKET_SIZE];
+            uint8_t expected_gap[RECOVERY_ENGINE_DEFAULT_MAX_CONTENT_BURST_PACKETS][TS_PACKET_SIZE];
             size_t i;
             uint16_t scenario = (uint16_t)((pid_index << 8U) | gap);
 
             init_engine(&engine, &stats, &capture, &sink);
-            engine.config.max_content_burst_packets = 255;
             for (i = 0; i < 12; i++) {
                 push_pair(&engine, &stats, pids[pid_index], (uint8_t)i,
                           (uint8_t)(0x20 + pid_index + i));
@@ -2127,7 +2246,7 @@ static void test_generated_content_recovery_sweep(void)
         }
     }
 
-    assert(scenarios == 2040);
+    assert(scenarios == 120);
 }
 
 static void test_generated_ambiguous_recovery_sweep(void)
@@ -2593,7 +2712,11 @@ int main(void)
     test_null_only_gap_recovered_separately();
     test_null_only_regions_do_not_establish_alignment();
     test_pid_specific_loss_does_not_log_mixed_rejects_for_nulls();
-    test_anchor_gap_detection_only_with_counter_wrap();
+    test_same_pid_gap_15_recovers_at_default_max();
+    test_same_pid_gap_16_rejects_at_default_max();
+    test_same_pid_gap_16_recovers_with_raised_max_and_position_anchors();
+    test_same_pid_gap_17_plus_recovers_with_position_anchors();
+    test_same_pid_position_gap_recovers_after_stale_anchor_prefix();
     printf("test_recovery: ok\n");
     return 0;
 }

@@ -12,6 +12,21 @@
 #define RECOVERY_DECISION_NONE 0
 #define RECOVERY_DECISION_INSERTED 1
 #define RECOVERY_DECISION_REJECTED 2
+#define MAX_SECONDARY_AFTER_ANCHOR_CANDIDATES 64U
+
+typedef struct secondary_after_anchor_candidates {
+    packet_record_t *records[MAX_SECONDARY_AFTER_ANCHOR_CANDIDATES];
+    size_t count;
+    bool truncated;
+} secondary_after_anchor_candidates_t;
+
+typedef struct recovery_candidate_validation {
+    bool valid;
+    recovery_reject_reason_t reject_reason;
+    const char *reason;
+    uint64_t missing_packets;
+    bool has_missing_count;
+} recovery_candidate_validation_t;
 
 static uint64_t hash_packet(const uint8_t packet[TS_PACKET_SIZE])
 {
@@ -476,28 +491,6 @@ static void update_alignment_from_match(recovery_engine_t *engine, const packet_
                                  engine->config.max_secondary_latency_ns);
 }
 
-static packet_record_t *find_matching_record_near(packet_history_t *history,
-                                                  const packet_record_t *record,
-                                                  int64_t expected_index,
-                                                  uint64_t radius)
-{
-    int64_t delta;
-
-    for (delta = -(int64_t)radius; delta <= (int64_t)radius; delta++) {
-        int64_t index = expected_index + delta;
-        packet_record_t *candidate;
-
-        if (index < 0) {
-            continue;
-        }
-        candidate = packet_history_find_index(history, (uint64_t)index);
-        if (candidate != NULL && records_match(record, candidate)) {
-            return candidate;
-        }
-    }
-    return NULL;
-}
-
 static bool has_confirmed_backward_run(packet_history_t *self,
                                        packet_history_t *other,
                                        const packet_record_t *record,
@@ -550,57 +543,44 @@ static packet_record_t *find_confirmed_matching_record_near(packet_history_t *se
     return NULL;
 }
 
-static uint32_t count_forward_exact_run(packet_history_t *primary_history,
-                                        packet_history_t *secondary_history,
-                                        const packet_record_t *primary,
-                                        const packet_record_t *secondary,
-                                        uint32_t max_count)
+static void add_secondary_after_anchor_candidate(secondary_after_anchor_candidates_t *candidates,
+                                                 packet_record_t *candidate)
 {
-    uint32_t count = 0;
+    size_t i;
 
-    while (count < max_count) {
-        packet_record_t *next_primary =
-            packet_history_find_index(primary_history, primary->stream_index + count);
-        packet_record_t *next_secondary =
-            packet_history_find_index(secondary_history, secondary->stream_index + count);
-
-        if (next_primary == NULL || next_secondary == NULL ||
-            !records_exact_non_error_match(next_primary, next_secondary)) {
-            break;
-        }
-        count++;
+    if (candidate == NULL) {
+        return;
     }
-    return count;
+    for (i = 0; i < candidates->count; i++) {
+        if (candidates->records[i] == candidate) {
+            return;
+        }
+    }
+    if (candidates->count >= MAX_SECONDARY_AFTER_ANCHOR_CANDIDATES) {
+        candidates->truncated = true;
+        return;
+    }
+    candidates->records[candidates->count++] = candidate;
 }
 
-static packet_record_t *find_best_forward_boundary_match(recovery_engine_t *engine,
-                                                         const packet_record_t *primary,
-                                                         uint64_t first_index,
-                                                         uint64_t last_index,
-                                                         packet_record_t **best_match,
-                                                         uint32_t *best_count)
+static void collect_secondary_after_anchor_candidates_in_range(recovery_engine_t *engine,
+                                                               const packet_record_t *primary,
+                                                               uint64_t first_index,
+                                                               uint64_t last_index,
+                                                               secondary_after_anchor_candidates_t *candidates)
 {
     uint64_t index;
 
     for (index = first_index; index <= last_index; index++) {
         packet_record_t *candidate = packet_history_find_index(&engine->history[1], index);
-        uint32_t forward_count;
 
-        if (candidate == NULL || !records_exact_non_error_match(primary, candidate)) {
-            continue;
+        if (candidate != NULL && records_exact_non_error_match(primary, candidate)) {
+            add_secondary_after_anchor_candidate(candidates, candidate);
         }
-        forward_count = count_forward_exact_run(&engine->history[0], &engine->history[1],
-                                                primary, candidate,
-                                                RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD);
-        if (forward_count >= RECOVERY_ENGINE_ALIGNMENT_MATCH_THRESHOLD) {
-            return candidate;
-        }
-        if (*best_match == NULL || forward_count > *best_count) {
-            *best_match = candidate;
-            *best_count = forward_count;
+        if (index == UINT64_MAX) {
+            break;
         }
     }
-    return NULL;
 }
 
 static void update_alignment(recovery_engine_t *engine, int stream_id, const packet_record_t *record)
@@ -653,24 +633,28 @@ static void update_alignment(recovery_engine_t *engine, int stream_id, const pac
     }
 }
 
-static packet_record_t *find_secondary_boundary_match(recovery_engine_t *engine,
-                                                      const packet_record_t *primary)
+static void find_secondary_boundary_matches(recovery_engine_t *engine,
+                                            const packet_record_t *primary,
+                                            secondary_after_anchor_candidates_t *candidates)
 {
     uint64_t first_index;
     uint64_t last_index;
     int64_t expected_index;
-    packet_record_t *match;
-    packet_record_t *best_match = NULL;
-    uint32_t best_count = 0;
+
+    memset(candidates, 0, sizeof(*candidates));
 
     if (primary->transport_error || primary->discontinuity_indicator) {
-        return NULL;
+        return;
     }
     if (engine->alignment.has_alignment) {
         expected_index = (int64_t)primary->stream_index + engine->alignment.offset_packets;
-        match = find_matching_record_near(&engine->history[1], primary, expected_index, 0);
-        if (match != NULL) {
-            return match;
+        if (expected_index >= 0) {
+            packet_record_t *exact = packet_history_find_index(&engine->history[1],
+                                                               (uint64_t)expected_index);
+
+            if (exact != NULL && records_exact_non_error_match(primary, exact)) {
+                add_secondary_after_anchor_candidate(candidates, exact);
+            }
         }
         if (expected_index + (int64_t)STAGE1_BOUNDARY_SEARCH_EXTRA >= 0) {
             uint64_t first_exact = expected_index > (int64_t)STAGE1_BOUNDARY_SEARCH_EXTRA
@@ -678,29 +662,202 @@ static packet_record_t *find_secondary_boundary_match(recovery_engine_t *engine,
                                        : 0ULL;
             uint64_t last_exact = (uint64_t)(expected_index + (int64_t)STAGE1_BOUNDARY_SEARCH_EXTRA);
 
-            match = find_best_forward_boundary_match(engine, primary, first_exact, last_exact,
-                                                     &best_match, &best_count);
-            if (match != NULL) {
-                return match;
-            }
+            collect_secondary_after_anchor_candidates_in_range(engine, primary, first_exact,
+                                                               last_exact, candidates);
         }
     }
     if (!engine->last_primary_anchor.valid ||
         primary->stream_index <= engine->last_primary_anchor.primary_index) {
-        return NULL;
+        return;
     }
 
     first_index = engine->last_primary_anchor.secondary_index + 1ULL;
     last_index = first_index +
                  (primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL) +
-                 (uint64_t)engine->config.max_content_burst_packets;
-    match = find_best_forward_boundary_match(engine, primary, first_index, last_index,
-                                             &best_match, &best_count);
-    if (match != NULL) {
-        return match;
+                 (uint64_t)engine->config.max_content_burst_packets + 1ULL;
+    collect_secondary_after_anchor_candidates_in_range(engine, primary, first_index,
+                                                       last_index, candidates);
+}
+
+static recovery_candidate_validation_t validate_exact_content_candidate(recovery_engine_t *engine,
+                                                                        const packet_record_t *primary,
+                                                                        const packet_record_t *secondary_match)
+{
+    recovery_candidate_validation_t result = {
+        false, RECOVERY_REJECT_MISSING_CANDIDATE, "not_content_gap", 0, false
+    };
+    output_pid_state_t states[REPORT_STATS_PIDS];
+    uint64_t primary_between;
+    uint64_t secondary_between;
+    uint64_t missing_packets;
+    uint64_t cc_missing_count = 0;
+    uint64_t candidate_first_index;
+    uint64_t candidate_count;
+    bool has_previous_cc;
+    bool has_cc_missing_count = false;
+    uint8_t previous_cc = 0;
+    packet_record_t *candidates[256] = {0};
+
+    if (primary->is_null || primary->transport_error || primary->discontinuity_indicator ||
+        !engine->last_primary_anchor.valid || secondary_match == NULL) {
+        return result;
+    }
+    if (secondary_match->stream_index <= engine->last_primary_anchor.secondary_index ||
+        primary->stream_index <= engine->last_primary_anchor.primary_index) {
+        return result;
     }
 
-    return best_match;
+    primary_between = primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL;
+    secondary_between = secondary_match->stream_index - engine->last_primary_anchor.secondary_index - 1ULL;
+    if (secondary_between < primary_between) {
+        return result;
+    }
+    missing_packets = secondary_between - primary_between;
+    if (record_fits_next_output(engine, primary)) {
+        return result;
+    }
+    has_previous_cc = previous_output_cc_for_record(engine, primary, &previous_cc);
+    if (has_previous_cc) {
+        has_cc_missing_count = infer_missing_from_cc(previous_cc, primary, &cc_missing_count);
+    }
+    if (!has_cc_missing_count && has_previous_cc && primary->has_payload &&
+        missing_packets > 0 && missing_packets <= 15U &&
+        primary->continuity_counter ==
+            (uint8_t)((previous_cc + missing_packets + 1ULL) & 0x0fU)) {
+        cc_missing_count = missing_packets;
+        has_cc_missing_count = true;
+    }
+    result.missing_packets = cc_missing_count;
+    result.has_missing_count = has_cc_missing_count;
+    if (!has_cc_missing_count || cc_missing_count == 0) {
+        return result;
+    }
+    if (cc_missing_count > engine->config.max_content_burst_packets) {
+        result.reject_reason = RECOVERY_REJECT_BURST_TOO_LARGE;
+        result.reason = "burst_too_large";
+        return result;
+    }
+    if (engine->alignment.confidence < engine->config.min_alignment_confidence) {
+        result.reject_reason = RECOVERY_REJECT_LOW_ALIGNMENT;
+        result.reason = "low_alignment";
+        return result;
+    }
+    if (!records_are_non_null_exact_anchor(packet_history_find_index(&engine->history[0],
+                                                                     engine->last_primary_anchor.primary_index),
+                                           packet_history_find_index(&engine->history[1],
+                                                                     engine->last_primary_anchor.secondary_index))) {
+        result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+        result.reason = "before_anchor";
+        return result;
+    }
+    if (primary->is_null || secondary_match->is_null ||
+        !records_exact_non_error_match(primary, secondary_match)) {
+        result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+        result.reason = "after_anchor";
+        return result;
+    }
+
+    candidate_first_index = engine->last_primary_anchor.secondary_index + 1ULL;
+    if (primary_between > 0 && secondary_between > primary_between) {
+        bool prefix_matches = true;
+        uint64_t i;
+
+        for (i = 0; i < primary_between; i++) {
+            packet_record_t *primary_prefix = packet_history_find_index(&engine->history[0],
+                                                                        engine->last_primary_anchor.primary_index + 1ULL + i);
+            packet_record_t *secondary_prefix = packet_history_find_index(&engine->history[1],
+                                                                          engine->last_primary_anchor.secondary_index + 1ULL + i);
+
+            if (primary_prefix == NULL || secondary_prefix == NULL ||
+                !records_exact_non_error_match(primary_prefix, secondary_prefix)) {
+                prefix_matches = false;
+                break;
+            }
+        }
+        if (prefix_matches) {
+            candidate_first_index += primary_between;
+        }
+    }
+
+    for (candidate_count = 0; candidate_count < cc_missing_count; candidate_count++) {
+        uint64_t index;
+        packet_record_t *candidate = NULL;
+        uint8_t expected_missing_cc = (uint8_t)((previous_cc + 1U + candidate_count) & 0x0fU);
+
+        for (index = candidate_first_index; index < secondary_match->stream_index; index++) {
+            packet_record_t *possible = packet_history_find_index(&engine->history[1], index);
+
+            if (possible == NULL) {
+                continue;
+            }
+            if (!possible->is_null && possible->has_payload && possible->pid == primary->pid &&
+                possible->continuity_counter == expected_missing_cc) {
+                if (candidate != NULL) {
+                    result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+                    result.reason = "multiple_candidates";
+                    return result;
+                }
+                candidate = possible;
+            }
+        }
+        if (candidate == NULL && missing_packets == 1) {
+            uint64_t fallback_index = primary_between == 0
+                                          ? engine->last_primary_anchor.secondary_index + 1ULL
+                                          : secondary_match->stream_index - 1ULL;
+
+            candidate = packet_history_find_index(&engine->history[1], fallback_index);
+        }
+        if (candidate == NULL) {
+            result.reject_reason = RECOVERY_REJECT_MISSING_CANDIDATE;
+            result.reason = "missing_candidate";
+            return result;
+        }
+        if (candidate->is_null) {
+            result.reject_reason = RECOVERY_REJECT_WRONG_PID;
+            result.reason = "null_candidate";
+            return result;
+        }
+        if (candidate->transport_error) {
+            result.reject_reason = RECOVERY_REJECT_TEI;
+            result.reason = "secondary_tei";
+            return result;
+        }
+        if (candidate->discontinuity_indicator) {
+            result.reject_reason = RECOVERY_REJECT_DISCONTINUITY;
+            result.reason = "secondary_discontinuity";
+            return result;
+        }
+        if (candidate->pid != primary->pid) {
+            result.reject_reason = RECOVERY_REJECT_WRONG_PID;
+            result.reason = "wrong_pid";
+            return result;
+        }
+        if (!candidate->has_payload || candidate->continuity_counter != expected_missing_cc) {
+            result.reject_reason = RECOVERY_REJECT_WRONG_COUNTER;
+            result.reason = "wrong_counter";
+            return result;
+        }
+        candidates[candidate_count] = candidate;
+    }
+
+    memcpy(states, engine->output_pid_state, sizeof(states));
+    for (candidate_count = 0; candidate_count < cc_missing_count; candidate_count++) {
+        if (!record_fits_output_states(states, candidates[candidate_count])) {
+            result.reject_reason = RECOVERY_REJECT_WRONG_COUNTER;
+            result.reason = "secondary_wrong_counter";
+            return result;
+        }
+        observe_output_states(states, candidates[candidate_count]);
+    }
+    if (!record_fits_output_states(states, primary)) {
+        result.reject_reason = RECOVERY_REJECT_WRONG_COUNTER;
+        result.reason = "after_anchor_wrong_counter";
+        return result;
+    }
+
+    result.valid = true;
+    result.reason = NULL;
+    return result;
 }
 
 static int try_recover_exact_content_gap(recovery_engine_t *engine,
@@ -718,6 +875,7 @@ static int try_recover_exact_content_gap(recovery_engine_t *engine,
     packet_record_t *before_primary;
     packet_record_t *before_secondary;
     packet_record_t *candidates[256] = {0};
+    uint64_t candidate_first_index;
     uint64_t candidate_count;
     output_pid_state_t states[REPORT_STATS_PIDS];
     const char *decision;
@@ -787,12 +945,34 @@ static int try_recover_exact_content_gap(recovery_engine_t *engine,
         return RECOVERY_DECISION_REJECTED;
     }
 
+    candidate_first_index = engine->last_primary_anchor.secondary_index + 1ULL;
+    if (primary_between > 0 && secondary_between > primary_between) {
+        bool prefix_matches = true;
+        uint64_t i;
+
+        for (i = 0; i < primary_between; i++) {
+            packet_record_t *primary_prefix = packet_history_find_index(&engine->history[0],
+                                                                        engine->last_primary_anchor.primary_index + 1ULL + i);
+            packet_record_t *secondary_prefix = packet_history_find_index(&engine->history[1],
+                                                                          engine->last_primary_anchor.secondary_index + 1ULL + i);
+
+            if (primary_prefix == NULL || secondary_prefix == NULL ||
+                !records_exact_non_error_match(primary_prefix, secondary_prefix)) {
+                prefix_matches = false;
+                break;
+            }
+        }
+        if (prefix_matches) {
+            candidate_first_index += primary_between;
+        }
+    }
+
     for (candidate_count = 0; candidate_count < cc_missing_count; candidate_count++) {
         uint64_t index;
         packet_record_t *candidate = NULL;
 
         expected_missing_cc = (uint8_t)((previous_cc + 1U + candidate_count) & 0x0fU);
-        for (index = engine->last_primary_anchor.secondary_index + 1ULL;
+        for (index = candidate_first_index;
              index < secondary_match->stream_index; index++) {
             packet_record_t *possible = packet_history_find_index(&engine->history[1], index);
 
@@ -989,6 +1169,271 @@ static int try_recover_primary_tei_packet(recovery_engine_t *engine,
     return 1;
 }
 
+static recovery_candidate_validation_t validate_null_position_candidate(recovery_engine_t *engine,
+                                                                        const packet_record_t *primary,
+                                                                        const packet_record_t *secondary_match)
+{
+    recovery_candidate_validation_t result = {
+        false, RECOVERY_REJECT_MISSING_CANDIDATE, "not_null_position_gap", 0, false
+    };
+    uint64_t primary_between;
+    uint64_t secondary_between;
+    uint64_t missing_packets;
+    uint64_t first_candidate_index;
+    uint64_t i;
+
+    if (primary->is_null || primary->transport_error || primary->discontinuity_indicator ||
+        !engine->last_primary_anchor.valid || secondary_match == NULL) {
+        return result;
+    }
+    if (secondary_match->stream_index <= engine->last_primary_anchor.secondary_index ||
+        primary->stream_index <= engine->last_primary_anchor.primary_index) {
+        return result;
+    }
+
+    primary_between = primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL;
+    secondary_between = secondary_match->stream_index - engine->last_primary_anchor.secondary_index - 1ULL;
+    if (secondary_between <= primary_between) {
+        return result;
+    }
+    missing_packets = secondary_between - primary_between;
+    result.missing_packets = missing_packets;
+    result.has_missing_count = true;
+    if (missing_packets == 0) {
+        result.reason = "not_null_position_gap";
+        return result;
+    }
+    if (missing_packets > engine->config.max_content_burst_packets) {
+        uint64_t scan_limit = (uint64_t)engine->config.max_content_burst_packets + 1ULL;
+
+        first_candidate_index = engine->last_primary_anchor.secondary_index + primary_between + 1ULL;
+        for (i = 0; i < scan_limit; i++) {
+            packet_record_t *candidate = packet_history_find_index(&engine->history[1],
+                                                                   first_candidate_index + i);
+
+            if (candidate == NULL) {
+                result.reject_reason = RECOVERY_REJECT_MISSING_CANDIDATE;
+                result.reason = "missing_candidate";
+                return result;
+            }
+            if (!candidate->is_null) {
+                result.reason = "not_null_position_gap";
+                return result;
+            }
+        }
+        result.reject_reason = RECOVERY_REJECT_BURST_TOO_LARGE;
+        result.reason = "null_burst_too_large";
+        return result;
+    }
+    if (engine->alignment.confidence < engine->config.min_alignment_confidence) {
+        result.reject_reason = RECOVERY_REJECT_LOW_ALIGNMENT;
+        result.reason = "low_alignment";
+        return result;
+    }
+    if (!records_are_non_null_exact_anchor(packet_history_find_index(&engine->history[0],
+                                                                     engine->last_primary_anchor.primary_index),
+                                           packet_history_find_index(&engine->history[1],
+                                                                     engine->last_primary_anchor.secondary_index))) {
+        result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+        result.reason = "before_anchor";
+        return result;
+    }
+    if (primary->is_null || secondary_match->is_null ||
+        !records_exact_non_error_match(primary, secondary_match)) {
+        result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+        result.reason = "after_anchor";
+        return result;
+    }
+
+    for (i = 0; i < primary_between; i++) {
+        packet_record_t *primary_prefix = packet_history_find_index(&engine->history[0],
+                                                                    engine->last_primary_anchor.primary_index + 1ULL + i);
+        packet_record_t *secondary_prefix = packet_history_find_index(&engine->history[1],
+                                                                      engine->last_primary_anchor.secondary_index + 1ULL + i);
+
+        if (primary_prefix == NULL || secondary_prefix == NULL ||
+            !records_exact_non_error_match(primary_prefix, secondary_prefix)) {
+            result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+            result.reason = "stale_anchor_prefix";
+            return result;
+        }
+    }
+
+    first_candidate_index = engine->last_primary_anchor.secondary_index + primary_between + 1ULL;
+    for (i = 0; i < missing_packets; i++) {
+        packet_record_t *candidate = packet_history_find_index(&engine->history[1],
+                                                               first_candidate_index + i);
+
+        if (candidate == NULL) {
+            result.reject_reason = RECOVERY_REJECT_MISSING_CANDIDATE;
+            result.reason = "missing_candidate";
+            return result;
+        }
+        if (!candidate->is_null) {
+            result.reason = "not_null_position_gap";
+            return result;
+        }
+        if (candidate->transport_error) {
+            result.reject_reason = RECOVERY_REJECT_TEI;
+            result.reason = "secondary_tei";
+            return result;
+        }
+        if (candidate->discontinuity_indicator) {
+            result.reject_reason = RECOVERY_REJECT_DISCONTINUITY;
+            result.reason = "secondary_discontinuity";
+            return result;
+        }
+    }
+
+    result.valid = true;
+    result.reject_reason = RECOVERY_REJECT_MISSING_CANDIDATE;
+    result.reason = NULL;
+    return result;
+}
+
+static recovery_candidate_validation_t validate_mixed_position_candidate(recovery_engine_t *engine,
+                                                                         const packet_record_t *primary,
+                                                                         const packet_record_t *secondary_match)
+{
+    recovery_candidate_validation_t result = {
+        false, RECOVERY_REJECT_MISSING_CANDIDATE, "not_mixed_position_gap", 0, false
+    };
+    output_pid_state_t states[REPORT_STATS_PIDS];
+    uint64_t primary_between;
+    uint64_t secondary_between;
+    uint64_t missing_packets;
+    uint64_t first_candidate_index;
+    bool saw_content = false;
+    uint8_t previous_cc = 0;
+    bool has_previous_cc = previous_output_cc_for_record(engine, primary, &previous_cc);
+    uint64_t i;
+
+    if (primary->is_null || primary->transport_error || primary->discontinuity_indicator ||
+        !engine->last_primary_anchor.valid || secondary_match == NULL) {
+        return result;
+    }
+    if (secondary_match->stream_index <= engine->last_primary_anchor.secondary_index ||
+        primary->stream_index <= engine->last_primary_anchor.primary_index) {
+        return result;
+    }
+
+    primary_between = primary->stream_index - engine->last_primary_anchor.primary_index - 1ULL;
+    secondary_between = secondary_match->stream_index - engine->last_primary_anchor.secondary_index - 1ULL;
+    if (secondary_between <= primary_between) {
+        return result;
+    }
+    missing_packets = secondary_between - primary_between;
+    result.missing_packets = missing_packets;
+    result.has_missing_count = true;
+    if (missing_packets == 0) {
+        return result;
+    }
+    if (missing_packets > engine->config.max_content_burst_packets) {
+        result.reject_reason = RECOVERY_REJECT_BURST_TOO_LARGE;
+        result.reason = "mixed_burst_too_large";
+        return result;
+    }
+    if (engine->alignment.confidence < engine->config.min_alignment_confidence) {
+        result.reject_reason = RECOVERY_REJECT_LOW_ALIGNMENT;
+        result.reason = "low_alignment";
+        return result;
+    }
+    if (!records_are_non_null_exact_anchor(packet_history_find_index(&engine->history[0],
+                                                                     engine->last_primary_anchor.primary_index),
+                                           packet_history_find_index(&engine->history[1],
+                                                                     engine->last_primary_anchor.secondary_index))) {
+        result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+        result.reason = "before_anchor";
+        return result;
+    }
+    if (primary->is_null || secondary_match->is_null ||
+        !records_exact_non_error_match(primary, secondary_match)) {
+        result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+        result.reason = "after_anchor";
+        return result;
+    }
+
+    for (i = 0; i < primary_between; i++) {
+        packet_record_t *primary_prefix = packet_history_find_index(&engine->history[0],
+                                                                    engine->last_primary_anchor.primary_index + 1ULL + i);
+        packet_record_t *secondary_prefix = packet_history_find_index(&engine->history[1],
+                                                                      engine->last_primary_anchor.secondary_index + 1ULL + i);
+
+        if (primary_prefix == NULL || secondary_prefix == NULL ||
+            !records_exact_non_error_match(primary_prefix, secondary_prefix)) {
+            result.reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+            result.reason = "stale_anchor_prefix";
+            return result;
+        }
+    }
+
+    memcpy(states, engine->output_pid_state, sizeof(states));
+    first_candidate_index = engine->last_primary_anchor.secondary_index + primary_between + 1ULL;
+    for (i = 0; i < missing_packets; i++) {
+        packet_record_t *candidate = packet_history_find_index(&engine->history[1],
+                                                               first_candidate_index + i);
+
+        if (candidate == NULL) {
+            result.reject_reason = RECOVERY_REJECT_MISSING_CANDIDATE;
+            result.reason = "missing_candidate";
+            return result;
+        }
+        if (candidate->transport_error) {
+            result.reject_reason = RECOVERY_REJECT_TEI;
+            result.reason = "secondary_tei";
+            return result;
+        }
+        if (candidate->discontinuity_indicator) {
+            result.reject_reason = RECOVERY_REJECT_DISCONTINUITY;
+            result.reason = "secondary_discontinuity";
+            return result;
+        }
+        if (!candidate->is_null) {
+            saw_content = true;
+        }
+        if (!record_fits_output_states(states, candidate)) {
+            result.reject_reason = RECOVERY_REJECT_WRONG_COUNTER;
+            result.reason = "candidate_counter_contradiction";
+            return result;
+        }
+        observe_output_states(states, candidate);
+    }
+    if (!saw_content) {
+        result.reason = "not_mixed_position_gap";
+        return result;
+    }
+    if (!record_fits_output_states(states, primary)) {
+        uint64_t cc_missing_count = 0;
+
+        if (has_previous_cc && infer_missing_from_cc(previous_cc, primary, &cc_missing_count) &&
+            cc_missing_count <= missing_packets) {
+            uint64_t matching_pid_count = 0;
+
+            for (i = 0; i < missing_packets; i++) {
+                packet_record_t *candidate = packet_history_find_index(&engine->history[1],
+                                                                       first_candidate_index + i);
+
+                if (candidate != NULL && !candidate->is_null && candidate->pid == primary->pid) {
+                    matching_pid_count++;
+                }
+            }
+            if (matching_pid_count == 0) {
+                result.reject_reason = RECOVERY_REJECT_WRONG_PID;
+                result.reason = "wrong_pid";
+                return result;
+            }
+        }
+        result.reject_reason = RECOVERY_REJECT_WRONG_COUNTER;
+        result.reason = "after_anchor_wrong_counter";
+        return result;
+    }
+
+    result.valid = true;
+    result.reject_reason = RECOVERY_REJECT_MISSING_CANDIDATE;
+    result.reason = NULL;
+    return result;
+}
+
 static int try_recover_mixed_position_gap(recovery_engine_t *engine,
                                           const packet_record_t *primary,
                                           const packet_record_t *secondary_match)
@@ -1025,9 +1470,6 @@ static int try_recover_mixed_position_gap(recovery_engine_t *engine,
         return 0;
     }
     missing_packets = secondary_between - primary_between;
-    if (primary_between != 0) {
-        return RECOVERY_DECISION_NONE;
-    }
     if (missing_packets == 0) {
         return 0;
     }
@@ -1063,7 +1505,19 @@ static int try_recover_mixed_position_gap(recovery_engine_t *engine,
     }
 
     memcpy(states, engine->output_pid_state, sizeof(states));
-    first_candidate_index = engine->last_primary_anchor.secondary_index + 1ULL;
+    for (i = 0; i < primary_between; i++) {
+        packet_record_t *primary_prefix = packet_history_find_index(&engine->history[0],
+                                                                    engine->last_primary_anchor.primary_index + 1ULL + i);
+        packet_record_t *secondary_prefix = packet_history_find_index(&engine->history[1],
+                                                                      engine->last_primary_anchor.secondary_index + 1ULL + i);
+
+        if (primary_prefix == NULL || secondary_prefix == NULL ||
+            !records_exact_non_error_match(primary_prefix, secondary_prefix)) {
+            return RECOVERY_DECISION_NONE;
+        }
+    }
+
+    first_candidate_index = engine->last_primary_anchor.secondary_index + primary_between + 1ULL;
     for (i = 0; i < missing_packets; i++) {
         packet_record_t *candidate = packet_history_find_index(&engine->history[1],
                                                                first_candidate_index + i);
@@ -1137,9 +1591,11 @@ static int try_recover_mixed_position_gap(recovery_engine_t *engine,
         return RECOVERY_DECISION_REJECTED;
     }
 
-    decision = !saw_null && same_content_pid && primary->pid == content_pid
-                   ? "recover_content_burst"
-                   : "recover_mixed_burst";
+    if (!saw_null && same_content_pid && primary->pid == content_pid) {
+        decision = missing_packets > 1 ? "recover_content_burst" : "recover_content";
+    } else {
+        decision = "recover_mixed_burst";
+    }
     recovery_decision_log(engine, 0, primary, previous_cc, has_previous_cc,
                           missing_packets, true, true, true, true,
                           decision, NULL);
@@ -1281,6 +1737,85 @@ static int try_recover_null_position_gap(recovery_engine_t *engine,
     return RECOVERY_DECISION_INSERTED;
 }
 
+typedef recovery_candidate_validation_t (*candidate_validator_fn)(recovery_engine_t *engine,
+                                                                  const packet_record_t *primary,
+                                                                  const packet_record_t *secondary_match);
+typedef int (*candidate_recovery_fn)(recovery_engine_t *engine,
+                                     const packet_record_t *primary,
+                                     const packet_record_t *secondary_match);
+
+static bool validation_reject_is_definitive(const recovery_candidate_validation_t *validation)
+{
+    return validation->reject_reason == RECOVERY_REJECT_WRONG_COUNTER ||
+           validation->reject_reason == RECOVERY_REJECT_TEI ||
+           validation->reject_reason == RECOVERY_REJECT_DISCONTINUITY ||
+           validation->reject_reason == RECOVERY_REJECT_BURST_TOO_LARGE ||
+           validation->reject_reason == RECOVERY_REJECT_LOW_ALIGNMENT;
+}
+
+static int try_unique_candidate_recovery(recovery_engine_t *engine,
+                                         const packet_record_t *primary,
+                                         const secondary_after_anchor_candidates_t *candidates,
+                                         candidate_validator_fn validator,
+                                         candidate_recovery_fn recover,
+                                         bool log_no_valid)
+{
+    const packet_record_t *winner = NULL;
+    recovery_candidate_validation_t best_reject = {
+        false, RECOVERY_REJECT_MISSING_CANDIDATE, "missing_candidate", 0, false
+    };
+    uint8_t previous_cc = 0;
+    bool has_previous_cc = previous_output_cc_for_record(engine, primary, &previous_cc);
+    size_t valid_count = 0;
+    size_t i;
+
+    if (candidates->truncated) {
+        recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
+                            0, false, true, engine->last_primary_anchor.valid, false,
+                            RECOVERY_REJECT_AMBIGUOUS, "too_many_after_anchors");
+        return RECOVERY_DECISION_REJECTED;
+    }
+
+    for (i = 0; i < candidates->count; i++) {
+        recovery_candidate_validation_t validation =
+            validator(engine, primary, candidates->records[i]);
+
+        if (validation.valid) {
+            winner = candidates->records[i];
+            valid_count++;
+            if (valid_count > 1) {
+                recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
+                                    validation.missing_packets,
+                                    validation.has_missing_count,
+                                    true, true, true,
+                                    RECOVERY_REJECT_AMBIGUOUS,
+                                    "multiple_valid_after_anchors");
+                return RECOVERY_DECISION_REJECTED;
+            }
+            continue;
+        }
+        if (best_reject.reason == NULL ||
+            (validation.has_missing_count && !best_reject.has_missing_count) ||
+            validation.reject_reason != RECOVERY_REJECT_MISSING_CANDIDATE) {
+            best_reject = validation;
+        }
+    }
+
+    if (valid_count == 1 && winner != NULL) {
+        return recover(engine, primary, winner);
+    }
+    if (candidates->count > 0 &&
+        (log_no_valid || validation_reject_is_definitive(&best_reject))) {
+        recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
+                            best_reject.missing_packets, best_reject.has_missing_count,
+                            true, engine->last_primary_anchor.valid, true,
+                            best_reject.reject_reason,
+                            best_reject.reason != NULL ? best_reject.reason : "no_valid_after_anchor");
+        return RECOVERY_DECISION_REJECTED;
+    }
+    return RECOVERY_DECISION_NONE;
+}
+
 static void update_primary_anchor(recovery_engine_t *engine, const packet_record_t *primary,
                                   const packet_record_t *secondary_match)
 {
@@ -1418,7 +1953,8 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
 
     while (engine->primary_queue.count > 0) {
         packet_record_t *primary = delay_queue_front(&engine->primary_queue);
-        packet_record_t *secondary_match;
+        secondary_after_anchor_candidates_t secondary_matches;
+        packet_record_t *single_secondary_match = NULL;
         bool primary_fits;
         bool logged_recovery_decision = false;
         bool inserted_recovery = false;
@@ -1432,7 +1968,10 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             break;
         }
 
-        secondary_match = find_secondary_boundary_match(engine, primary);
+        find_secondary_boundary_matches(engine, primary, &secondary_matches);
+        if (secondary_matches.count == 1 && !secondary_matches.truncated) {
+            single_secondary_match = secondary_matches.records[0];
+        }
         primary_fits = record_fits_next_output(engine, primary);
         if (primary->transport_error) {
             int recovered = try_recover_primary_tei_packet(engine, primary);
@@ -1447,8 +1986,11 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             }
         }
         if (!inserted_recovery && !logged_recovery_decision &&
-            engine->last_primary_anchor.valid && secondary_match != NULL) {
-            int recovered = try_recover_null_position_gap(engine, primary, secondary_match);
+            engine->last_primary_anchor.valid && secondary_matches.count > 0) {
+            int recovered = try_unique_candidate_recovery(engine, primary, &secondary_matches,
+                                                          validate_null_position_candidate,
+                                                          try_recover_null_position_gap,
+                                                          false);
 
             if (recovered < 0) {
                 return -1;
@@ -1460,8 +2002,11 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             }
         }
         if (!inserted_recovery && !logged_recovery_decision &&
-            engine->last_primary_anchor.valid && secondary_match != NULL) {
-            int recovered = try_recover_mixed_position_gap(engine, primary, secondary_match);
+            engine->last_primary_anchor.valid && secondary_matches.count > 0) {
+            int recovered = try_unique_candidate_recovery(engine, primary, &secondary_matches,
+                                                          validate_mixed_position_candidate,
+                                                          try_recover_mixed_position_gap,
+                                                          false);
 
             if (recovered < 0) {
                 return -1;
@@ -1474,8 +2019,11 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
         }
         if (!inserted_recovery && !logged_recovery_decision &&
             !primary_fits &&
-            engine->last_primary_anchor.valid && secondary_match != NULL) {
-            int recovered = try_recover_exact_content_gap(engine, primary, secondary_match);
+            engine->last_primary_anchor.valid && secondary_matches.count > 0) {
+            int recovered = try_unique_candidate_recovery(engine, primary, &secondary_matches,
+                                                          validate_exact_content_candidate,
+                                                          try_recover_exact_content_gap,
+                                                          true);
 
             if (recovered < 0) {
                 return -1;
@@ -1500,22 +2048,25 @@ int recovery_engine_drain(recovery_engine_t *engine, bool force)
             if (low_alignment) {
                 reason = "low_alignment";
                 reject_reason = RECOVERY_REJECT_LOW_ALIGNMENT;
-            } else if (before_anchor && secondary_match == NULL) {
+            } else if (before_anchor && secondary_matches.count == 0) {
                 reason = "no_after_anchor";
+                reject_reason = RECOVERY_REJECT_AMBIGUOUS;
+            } else if (secondary_matches.truncated) {
+                reason = "too_many_after_anchors";
                 reject_reason = RECOVERY_REJECT_AMBIGUOUS;
             }
 
             recovery_reject_log(engine, primary, previous_cc, has_previous_cc,
                                 missing_count, has_missing_count,
-                                secondary_match != NULL,
+                                secondary_matches.count > 0,
                                 before_anchor,
-                                secondary_match != NULL,
+                                secondary_matches.count > 0,
                                 reject_reason, reason);
         }
         if (output_record(engine, primary) != 0) {
             return -1;
         }
-        update_primary_anchor(engine, primary, secondary_match);
+        update_primary_anchor(engine, primary, single_secondary_match);
         engine->primary_gap.valid = true;
         engine->primary_gap.arrival_time_ns = primary->arrival_time_ns;
         engine->primary_gap.continuity_errors = primary->stream_continuity_errors;
